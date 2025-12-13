@@ -323,7 +323,7 @@ def StrehlFromMask(psf, mask):
     return StrehlFromReference(psf, ref)
 
 
-def convolve(psf, kernel, xp=defaultArrayBackend):
+def convolve(psf, kernel, xp=defaultArrayBackend, skip_norm=False):
     xp = psf.xp
     if (psf.N != kernel.N):
         print('psf and kernel sampling not compatible (grids sizes in pixels are different!)')
@@ -337,7 +337,10 @@ def convolve(psf, kernel, xp=defaultArrayBackend):
 #        return
     result = Field(psf.wvl, psf.N, psf.width, unit='m')
 
-    result.sampling = xp.real( KernelConvolve(psf.sampling/psf.sampling.sum(), kernel.sampling) )
+    if skip_norm:
+        result.sampling = xp.real( KernelConvolve(psf.sampling                   , kernel.sampling) )
+    else:
+        result.sampling = xp.real( KernelConvolve(psf.sampling/psf.sampling.sum(), kernel.sampling) )
 
     result.sampling = centralSquare(result.sampling, int(psf.N), xp)
     if xp.__name__=='cupy':
