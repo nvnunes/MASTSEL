@@ -19,6 +19,31 @@ from configparser import ConfigParser
 import yaml
 import os
 
+def method_lru_cache(maxsize=None,verbose=False):
+    """Decorator that works like lru_cache but ignores the self parameter."""
+    def decorator(func):
+        cache = {}
+
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            # Create a key based only on the arguments (not on self)
+            key = (args, tuple(sorted(kwargs.items())))
+
+            if key in cache:
+                if verbose:
+                    print(f"Cache hit!")
+                return cache[key]
+
+            result = func(self, *args, **kwargs)
+            cache[key] = result
+            return result
+
+        wrapper.cache_clear = cache.clear
+        wrapper.cache_info = lambda: f"Cache size: {len(cache)}"
+        return wrapper
+
+    return decorator
+
 def cpuArray(v):
     if isinstance(v,np.ndarray) or isinstance(v,np.float64) or isinstance(v, float):
         return v
@@ -34,6 +59,73 @@ def maxStableGain(delay):
         maxG = 0.1
     return maxG
 
+def detect_tiptop_path():
+    """Auto-detect TIPTOP project root path"""
+    from pathlib import Path
+    # --- Method 1: Standard package inspection (preferred, fast, and reliable) ---
+    try:
+        import tiptop
+        # The project root is assumed to be the parent of the 'tiptop' package directory.
+        # e.g., from /path/to/project/tiptop/__init__.py -> get /path/to/project
+        project_root = Path(tiptop.__file__).resolve().parent.parent
+        return str(project_root)
+
+    except ImportError:
+        import inspect
+        # --- Method 2: Fallback via call stack inspection ---
+        # This is useful when running from a source checkout without installation.
+        try: 
+            for frame_info in inspect.stack(context=0):
+                p = Path(frame_info.filename).resolve()
+                for parent in (p, *p.parents):
+                    if parent.name == 'tiptop':
+                        return str(parent.parent)   # Repository root = parent of the "tiptop" directory
+        except Exception:
+            pass
+    return None
+
+def detect_p3_path():
+    """Auto-detect P3 project root path"""
+    from pathlib import Path
+    try:
+        import p3
+        project_root = Path(p3.__file__).resolve().parent
+        return str(project_root)
+    except Exception:
+        return None
+
+PATH_TIPTOP = detect_tiptop_path()
+PATH_P3 = detect_p3_path()
+
+def resolve_config_path(path_value, path_root, path_p3, path_tiptop=None):
+    """
+    Resolve configuration file paths for both P3 and TIPTOP
+    - path_root has priority if it is not empty.
+    - aoSystem/... => resolved under path_p3
+    - tiptop/...   => resolved under path_tiptop (if available)
+    - otherwise: returns as is (absolute or current relative)
+    """
+    if not path_value or path_value == '':
+        return ''
+
+    # Explicit path_root has priority
+    if path_root:
+        return os.path.join(path_root, path_value)
+
+    # Clean path for consistent checking (remove leading slash)
+    clean_path = path_value.lstrip('/')
+
+    # P3 relative paths
+    if path_p3 and clean_path.startswith('aoSystem'):
+        return os.path.join(path_p3, clean_path)
+
+    # TIPTOP relative paths
+    if path_tiptop and clean_path.startswith('tiptop'):
+        return os.path.join(path_tiptop, clean_path)
+
+    # Default: use as-is (could be absolute or relative to current dir)
+    return path_value
+
 class MavisLO(object):
 
     def check_section_key(self, primary):
@@ -41,7 +133,7 @@ class MavisLO(object):
             return self.config.has_section(primary)
         elif self.configType == 'yml':
             return primary in self.my_yaml_dict.keys()
-    
+
     def check_config_key(self, primary, secondary):
         if self.configType == 'ini':
             return self.config.has_option(primary, secondary)
@@ -64,7 +156,7 @@ class MavisLO(object):
         self.displayEquation = False
 
         if self.verbose: np.set_printoptions(precision=3)
-        
+
         filename_ini = os.path.join(path, parametersFile + '.ini')
         filename_yml = os.path.join(path, parametersFile + '.yml')
 
@@ -83,17 +175,20 @@ class MavisLO(object):
             print('The .ini or .yml file does not exist\n')
             self.error = True
             return
-        
-        self.TelescopeDiameter      = self.get_config_value('telescope','TelescopeDiameter')  
-        self.ZenithAngle            = self.get_config_value('telescope','ZenithAngle')  
-        self.TechnicalFoV           = self.get_config_value('telescope','TechnicalFoV')  
-        self.ObscurationRatio       = self.get_config_value('telescope','ObscurationRatio')   
+
+        self.TelescopeDiameter      = self.get_config_value('telescope','TelescopeDiameter')
+        self.ZenithAngle            = self.get_config_value('telescope','ZenithAngle')
+        self.TechnicalFoV           = self.get_config_value('telescope','TechnicalFoV')
+        if self.check_config_key('telescope','ObscurationRatio'):
+            self.ObscurationRatio   = self.get_config_value('telescope','ObscurationRatio')
+        else:
+            self.ObscurationRatio   = 0.0
 
         self.AtmosphereWavelength   = self.get_config_value('atmosphere','Wavelength')
         self.L0                     = self.get_config_value('atmosphere','L0')
         self.Cn2Weights             = self.get_config_value('atmosphere','Cn2Weights')
         self.Cn2Heights             = self.get_config_value('atmosphere','Cn2Heights')
-       
+
         if np.min(self.Cn2Heights) == 0:
             self.Cn2Heights[np.argmin(self.Cn2Heights)] = 1e-6
 
@@ -113,6 +208,9 @@ class MavisLO(object):
                 self.N_sa_tot_LO.append(n**2)
 
         self.PixelScale_LO          = self.get_config_value('sensor_LO','PixelScale')
+        # if self.PixelScale_LO is a scalar makes a list on n elements
+        if not isinstance(self.PixelScale_LO, list):
+            self.PixelScale_LO = [self.PixelScale_LO] * len(self.NumberLenslets)
         self.WindowRadiusWCoG_LO    = self.get_config_value('sensor_LO','WindowRadiusWCoG')
         if self.WindowRadiusWCoG_LO=='optimize':
             self.WindowRadiusWCoG_LO = 0
@@ -127,7 +225,6 @@ class MavisLO(object):
         # this is called v (nu greek letter) in MAVIS AOM formulas
         self.NewValueThrPix_LO      = self.get_config_value('sensor_LO','NewValueThrPix')
 
-        
         if self.check_config_key('sensor_LO','noNoise'):
             self.noNoise = self.get_config_value('sensor_LO','noNoise')
         else:
@@ -154,6 +251,11 @@ class MavisLO(object):
         self.SensorFrameRate_HO     = self.get_config_value('RTC','SensorFrameRate_HO')
         self.LoopDelaySteps_HO      = self.get_config_value('RTC','LoopDelaySteps_HO')
 
+        if self.check_config_key('RTC','MMSE_Rec_LO'):
+            self.MMSE_Rec_LO = self.get_config_value('RTC','MMSE_Rec_LO')
+        else:
+            self.MMSE_Rec_LO = True
+
         if self.check_section_key('sensor_Focus'):
             self.WindowRadiusWCoG_Focus  = self.get_config_value('sensor_Focus','WindowRadiusWCoG')
             if self.WindowRadiusWCoG_Focus=='optimize':
@@ -161,6 +263,9 @@ class MavisLO(object):
             self.skyBackground_Focus     = self.get_config_value('sensor_Focus','SkyBackground')
             self.Dark_Focus              = self.get_config_value('sensor_Focus','Dark')
             self.PixelScale_Focus        = self.get_config_value('sensor_Focus','PixelScale')
+            # if self.PixelScale_Focus is a scalar makes a list on n elements
+            if not isinstance(self.PixelScale_Focus, list):
+                self.PixelScale_Focus = [self.PixelScale_Focus] * len(self.NumberLenslets)
             self.ExcessNoiseFactor_Focus = self.get_config_value('sensor_Focus','ExcessNoiseFactor')
             self.sigmaRON_Focus          = self.get_config_value('sensor_Focus','SigmaRON')
             self.NumberLenslets_Focus    = self.get_config_value('sensor_Focus','NumberLenslets')
@@ -200,8 +305,8 @@ class MavisLO(object):
                 self.N_sa_tot_Focus.append(n**2)
 
         defaultCompute = 'GPU'
-        defaultIntegralDiscretization1 = 1000
-        defaultIntegralDiscretization2 = 4000
+        defaultIntegralDiscretization1 = 250
+        defaultIntegralDiscretization2 = 1000
         self.computationPlatform = defaultCompute
         self.integralDiscretization1 = defaultIntegralDiscretization1
         self.integralDiscretization2 = defaultIntegralDiscretization2
@@ -215,7 +320,6 @@ class MavisLO(object):
                 self.integralDiscretization2 = self.get_config_value('COMPUTATION','integralDiscretization2')
             if self.check_config_key('COMPUTATION','simpleVarianceComputation'):
                 print('simpleVarianceComputation method is deprecated, it will not be used!')
-
 
         if self.check_config_key('atmosphere','r0_Value') and self.check_config_key('atmosphere','Seeing'):
             print('%%%%%%%% ATTENTION %%%%%%%%')
@@ -250,17 +354,19 @@ class MavisLO(object):
             self.WindSpeed = self.get_config_value('atmosphere','testWindspeed')
         else:
             self.wSpeed = self.get_config_value('atmosphere','WindSpeed')
-            self.WindSpeed = (np.dot( np.power(np.asarray(self.wSpeed), 5.0/3.0), np.asarray(self.Cn2Weights) ) / np.sum( np.asarray(self.Cn2Weights) ) ) ** (3.0/5.0)
+            self.WindSpeed = (np.dot( np.power(np.asarray(self.wSpeed), 5.0/3.0), np.asarray(self.Cn2Weights) )
+                              / np.sum( np.asarray(self.Cn2Weights) ) ) ** (3.0/5.0)
 
         #
-        # END OF SETTING PARAMETERS READ FROM FILE       
+        # END OF SETTING PARAMETERS READ FROM FILE
         #
        
         airmass = 1/np.cos(self.ZenithAngle*np.pi/180)
         self.r0_Value = self.r0_Value * airmass**(-3.0/5.0)
 
         self.Cn2Heights = [x * airmass for x in self.Cn2Heights]
-        self.Cn2HeightsMean = (np.dot( np.power(np.asarray(self.Cn2Heights), 5.0/3.0), np.asarray(self.Cn2Weights) ) / np.sum( np.asarray(self.Cn2Weights) ) ) ** (3.0/5.0)
+        self.Cn2HeightsMean = (np.dot( np.power(np.asarray(self.Cn2Heights), 5.0/3.0), np.asarray(self.Cn2Weights) )
+                               / np.sum( np.asarray(self.Cn2Weights) ) ) ** (3.0/5.0)
 
         # from mas to nm
         self.mas2nm = np.pi/(180*3600*1000) * self.TelescopeDiameter / (4*1e-9)
@@ -286,7 +392,7 @@ class MavisLO(object):
         # diffraction limited FWHM - one aperture
         self.subapNGS_FWHM_mas = self.SensingWavelength_LO/(self.TelescopeDiameter/self.NumberLenslets[0])*radiansToArcsecs*1000
         self.subapFocus_FWHM_mas = self.SensingWavelength_Focus/(self.TelescopeDiameter/self.NumberLenslets_Focus[0])*radiansToArcsecs*1000
-        
+
         if self.computationPlatform=='GPU' and gpuEnabled:
             self.mIt = Integrator(cp, cp.float64, '')
             self.mItcomplex = Integrator(cp, cp.complex64, '')
@@ -295,6 +401,11 @@ class MavisLO(object):
             self.mIt = Integrator(np, float, '')
             self.mItcomplex = Integrator(np, complex, '')
             self.platformlib = cpulib
+
+        self.min_freq_cov = 1e-3
+        self.max_freq_cov = 100
+        self.min_freq_turb = 1e-4
+        self.max_freq_turb = 1000
 
         self.MavisFormulas = _mavisFormulas
         self.zernikeCov_rh1 = self.MavisFormulas.getFormulaRhs('ZernikeCovarianceD')
@@ -316,6 +427,8 @@ class MavisLO(object):
         self.maxLOtFreq = 0.5*self.SensorFrameRate_LO
         if self.check_config_key('telescope','windPsdFile'):
             windPsdFile = self.get_config_value('telescope','windPsdFile')
+            windPsdFile = resolve_config_path(windPsdFile, path_root = '', path_p3 = PATH_P3,
+                                              path_tiptop=PATH_TIPTOP)
             self.psd_freq, self.psd_tip_wind, self.psd_tilt_wind = self.loadWindPsd(windPsdFile)
         else:
             if self.verbose:
@@ -342,9 +455,10 @@ class MavisLO(object):
 
 
     def loadWindPsd(self, filename):
-        hdul = fits.open(filename)
-        psd_data = np.asarray(hdul[0].data, np.float32)
-        hdul.close()
+        filename = resolve_config_path(filename, path_root = '', path_p3 = PATH_P3,
+                                        path_tiptop=PATH_TIPTOP)
+        with fits.open(filename) as hdul:
+            psd_data = np.asarray(hdul[0].data, np.float32)
         psd_freq = np.asarray(np.linspace(0.2, self.maxLOtFreq, int(5*self.maxLOtFreq)))
         psd_tip_wind = np.interp(psd_freq, psd_data[0,:], psd_data[1,:],left=0,right=0)
         psd_tilt_wind = np.interp(psd_freq, psd_data[0,:], psd_data[2,:],left=0,right=0)
@@ -372,7 +486,7 @@ class MavisLO(object):
                 print('    no apIM_func')
         return apIM, apIM_func
 
-    
+
     def specializedMeanVarFormulas(self, kind):
         dd0 = {self.MavisFormulas.symbol_map['t']:self.ThresholdWCoG_LO, self.MavisFormulas.symbol_map['nu']:self.NewValueThrPix_LO, self.MavisFormulas.symbol_map['sigma_RON']:self.sigmaRON_LO}
         dd1 = {self.MavisFormulas.symbol_map['b']:(self.Dark_LO+self.skyBackground_LO)/self.SensorFrameRate_LO}
@@ -402,7 +516,9 @@ class MavisLO(object):
         return aFunction, expr0
 
     def specializedGMeanVarFormulas(self, kind):
-        dd0 = {self.MavisFormulas.symbol_map['t']:self.ThresholdWCoG_LO, self.MavisFormulas.symbol_map['nu']:self.NewValueThrPix_LO, self.MavisFormulas.symbol_map['sigma_RON']:self.sigmaRON_LO}
+        dd0 = {self.MavisFormulas.symbol_map['t']:self.ThresholdWCoG_LO,
+               self.MavisFormulas.symbol_map['nu']:self.NewValueThrPix_LO,
+               self.MavisFormulas.symbol_map['sigma_RON']:self.sigmaRON_LO}
         dd1 = {self.MavisFormulas.symbol_map['b']:(self.Dark_LO+self.skyBackground_LO)/self.SensorFrameRate_LO}
         dd2 = {self.MavisFormulas.symbol_map['F']:self.ExcessNoiseFactor_LO}
         expr0 = self.MavisFormulas[kind]
@@ -417,8 +533,18 @@ class MavisLO(object):
         return expr0
 
     def specializedTurbFuncs(self):
-        aTurbPSDTip = self.MavisFormulas['turbPSDTip'].subs({self.MavisFormulas.symbol_map['V']:self.WindSpeed, self.MavisFormulas.symbol_map['R']:self.TelescopeDiameter/2.0, self.MavisFormulas.symbol_map['r_0']:self.r0_Value, self.MavisFormulas.symbol_map['L_0']:self.L0, self.MavisFormulas.symbol_map['k_y_min']:0.0001, self.MavisFormulas.symbol_map['k_y_max']:100})
-        aTurbPSDTilt = self.MavisFormulas['turbPSDTilt'].subs({self.MavisFormulas.symbol_map['V']:self.WindSpeed, self.MavisFormulas.symbol_map['R']:self.TelescopeDiameter/2.0, self.MavisFormulas.symbol_map['r_0']:self.r0_Value, self.MavisFormulas.symbol_map['L_0']:self.L0, self.MavisFormulas.symbol_map['k_y_min']:0.0001, self.MavisFormulas.symbol_map['k_y_max']:100})
+        aTurbPSDTip = self.MavisFormulas['turbPSDTip'].subs({self.MavisFormulas.symbol_map['V']:self.WindSpeed,
+                                                             self.MavisFormulas.symbol_map['R']:self.TelescopeDiameter/2.0,
+                                                             self.MavisFormulas.symbol_map['r_0']:self.r0_Value,
+                                                             self.MavisFormulas.symbol_map['L_0']:self.L0,
+                                                             self.MavisFormulas.symbol_map['k_y_min']:self.min_freq_turb,
+                                                             self.MavisFormulas.symbol_map['k_y_max']:self.max_freq_turb})
+        aTurbPSDTilt = self.MavisFormulas['turbPSDTilt'].subs({self.MavisFormulas.symbol_map['V']:self.WindSpeed,
+                                                               self.MavisFormulas.symbol_map['R']:self.TelescopeDiameter/2.0,
+                                                               self.MavisFormulas.symbol_map['r_0']:self.r0_Value,
+                                                               self.MavisFormulas.symbol_map['L_0']:self.L0,
+                                                               self.MavisFormulas.symbol_map['k_y_min']:self.min_freq_turb,
+                                                               self.MavisFormulas.symbol_map['k_y_max']:self.max_freq_turb})
         if self.displayEquation:
             print('mavisLO.specializedTurbFuncs')
             print('    aTurbPSDTip')
@@ -434,8 +560,14 @@ class MavisLO(object):
         return aTurbPSDTip, aTurbPSDTilt
 
     def specializedFocusFuncs(self):
-        aTurbPSDFocus = self.MavisFormulas['turbPSDFocus'].subs({self.MavisFormulas.symbol_map['V']:self.WindSpeed, self.MavisFormulas.symbol_map['R']:self.TelescopeDiameter/2.0, self.MavisFormulas.symbol_map['r_0']:self.r0_Value, self.MavisFormulas.symbol_map['L_0']:self.L0, self.MavisFormulas.symbol_map['k_y_min']:0.0001, self.MavisFormulas.symbol_map['k_y_max']:100})
-        aSodiumPSDFocus = self.MavisFormulas['sodiumPSDFocus'].subs({self.MavisFormulas.symbol_map['R']:self.TelescopeDiameter/2.0, self.MavisFormulas.symbol_map['ZenithAngle']:self.ZenithAngle})
+        aTurbPSDFocus = self.MavisFormulas['turbPSDFocus'].subs({self.MavisFormulas.symbol_map['V']:self.WindSpeed,
+                                                                 self.MavisFormulas.symbol_map['R']:self.TelescopeDiameter/2.0,
+                                                                 self.MavisFormulas.symbol_map['r_0']:self.r0_Value,
+                                                                 self.MavisFormulas.symbol_map['L_0']:self.L0,
+                                                                 self.MavisFormulas.symbol_map['k_y_min']:self.min_freq_turb,
+                                                                 self.MavisFormulas.symbol_map['k_y_max']:self.max_freq_turb})
+        aSodiumPSDFocus = self.MavisFormulas['sodiumPSDFocus'].subs({self.MavisFormulas.symbol_map['R']:self.TelescopeDiameter/2.0,
+                                                                     self.MavisFormulas.symbol_map['ZenithAngle']:self.ZenithAngle})
         if self.displayEquation:
             print('mavisLO.specializedFocusFuncs')
             print('    aTurbPSDFocus')
@@ -531,12 +663,17 @@ class MavisLO(object):
     
     
     def buildSpecializedCovFunctions(self):
-        covValue_integrationLimits = (sp.symbols('f', positive=True), 1e-3, 10.0)
+        covValue_integrationLimits = (sp.symbols('f', positive=True), self.min_freq_cov, self.max_freq_cov)
         p = sp.symbols('p', real=False)
         cov_expr={}
         if self.filtZernikeCov:
-            paramDictBaseCov = { self.MavisFormulas.symbol_map['L_0']: self.L0, self.MavisFormulas.symbol_map['r_0']: self.r0_Value, self.MavisFormulas.symbol_map['R_1']: self.TelescopeDiameter/2.0, self.MavisFormulas.symbol_map['R_2']: self.TelescopeDiameter/2.0, \
-                                 self.MavisFormulas.symbol_map['fr_ho']: self.SensorFrameRate_HO, self.MavisFormulas.symbol_map['fov_radius']: 0.5*self.TechnicalFoV, self.MavisFormulas.symbol_map['h_mean']: self.Cn2HeightsMean, \
+            paramDictBaseCov = { self.MavisFormulas.symbol_map['L_0']: self.L0,
+                                 self.MavisFormulas.symbol_map['r_0']: self.r0_Value,
+                                 self.MavisFormulas.symbol_map['R_1']: self.TelescopeDiameter/2.0,
+                                 self.MavisFormulas.symbol_map['R_2']: self.TelescopeDiameter/2.0,
+                                 self.MavisFormulas.symbol_map['fr_ho']: self.SensorFrameRate_HO,
+                                 self.MavisFormulas.symbol_map['fov_radius']: 0.5*self.TechnicalFoV,
+                                 self.MavisFormulas.symbol_map['h_mean']: self.Cn2HeightsMean,
                                  self.MavisFormulas.symbol_map['wind_speed_mean']: self.WindSpeed}
             if self.displayEquation:
                 print('zernikeCov_rh1_filt')
@@ -551,9 +688,12 @@ class MavisLO(object):
                     kk_value = jj                    
                     nj_value, mj_value = noll_to_zern(jj_value)
                     nk_value, mk_value = noll_to_zern(kk_value)
-                    rexpr = expr.subs({self.MavisFormulas.symbol_map['j']: jj_value, self.MavisFormulas.symbol_map['k']: kk_value, 
-                                        self.MavisFormulas.symbol_map['n_j']: nj_value, self.MavisFormulas.symbol_map['m_j']: abs(mj_value), 
-                                        self.MavisFormulas.symbol_map['n_k']: nk_value, self.MavisFormulas.symbol_map['m_k']: abs(mk_value)})
+                    rexpr = expr.subs({self.MavisFormulas.symbol_map['j']: jj_value,
+                                       self.MavisFormulas.symbol_map['k']: kk_value, 
+                                       self.MavisFormulas.symbol_map['n_j']: nj_value,
+                                       self.MavisFormulas.symbol_map['m_j']: abs(mj_value),
+                                       self.MavisFormulas.symbol_map['n_k']: nk_value,
+                                       self.MavisFormulas.symbol_map['m_k']: abs(mk_value)})
                     
                     aa = rexpr.subs(paramDictBaseCov)
                     # aa = cov_expr_jk(self.zernikeCov_rh1_filt, ii, jj).subs(paramDictBaseCov)
@@ -561,7 +701,10 @@ class MavisLO(object):
                     aaint = aaint.subs({self.MavisFormulas.symbol_map['rho']: sp.Abs(p), self.MavisFormulas.symbol_map['theta']: sp.arg(p)} )
                     cov_expr[ii+10*jj] = aaint
         else:
-            paramDictBaseCov = { self.MavisFormulas.symbol_map['L_0']: self.L0, self.MavisFormulas.symbol_map['r_0']: self.r0_Value, self.MavisFormulas.symbol_map['R_1']: self.TelescopeDiameter/2.0, self.MavisFormulas.symbol_map['R_2']: self.TelescopeDiameter/2.0}
+            paramDictBaseCov = { self.MavisFormulas.symbol_map['L_0']: self.L0,
+                                self.MavisFormulas.symbol_map['r_0']: self.r0_Value,
+                                self.MavisFormulas.symbol_map['R_1']: self.TelescopeDiameter/2.0,
+                                self.MavisFormulas.symbol_map['R_2']: self.TelescopeDiameter/2.0}
             for ii in [2,3,4]:
                 for jj in [2,3,4]:
                     expr = self.zernikeCov_rh1
@@ -569,9 +712,12 @@ class MavisLO(object):
                     kk_value = jj                    
                     nj_value, mj_value = noll_to_zern(jj_value)
                     nk_value, mk_value = noll_to_zern(kk_value)
-                    rexpr = expr.subs({self.MavisFormulas.symbol_map['j']: jj_value, self.MavisFormulas.symbol_map['k']: kk_value, 
-                                        self.MavisFormulas.symbol_map['n_j']: nj_value, self.MavisFormulas.symbol_map['m_j']: abs(mj_value), 
-                                        self.MavisFormulas.symbol_map['n_k']: nk_value, self.MavisFormulas.symbol_map['m_k']: abs(mk_value)})
+                    rexpr = expr.subs({self.MavisFormulas.symbol_map['j']: jj_value,
+                                       self.MavisFormulas.symbol_map['k']: kk_value, 
+                                        self.MavisFormulas.symbol_map['n_j']: nj_value,
+                                        self.MavisFormulas.symbol_map['m_j']: abs(mj_value), 
+                                        self.MavisFormulas.symbol_map['n_k']: nk_value,
+                                        self.MavisFormulas.symbol_map['m_k']: abs(mk_value)})
                     
                     aa = rexpr.subs(paramDictBaseCov)
                     # aa = cov_expr_jk(self.zernikeCov_rh1, ii, jj).subs(paramDictBaseCov)
@@ -595,34 +741,58 @@ class MavisLO(object):
         R_1 = np.dot(P_alpha1, rec_tomo)
         return P_mat, rec_tomo, R_0, R_1
 
-    
-    def buildReconstuctor2(self, aCartPointingCoordsV, aCartNGSCoords):
+    def buildReconstuctor2(self, aCartPointingCoordsV, aCartNGSCoords, Cnn=None, Caa=None):
         npointings = aCartPointingCoordsV.shape[0]
         nstars = aCartNGSCoords.shape[0]
+
         if nstars==1:
             R_1 = np.zeros((2*npointings, 2*nstars))
             for k in range(npointings):
                 R_1[2*k:2*(k+1), :] = np.identity(2)
-
             return R_1, R_1.transpose()
-        else:        
-            P, P_func = self.specializedIM()
-            p_mat_list = []
-            for ii in range(nstars):
-                p_mat_list.append(P_func(aCartNGSCoords[ii,0]*arcsecsToRadians, aCartNGSCoords[ii,1]*arcsecsToRadians))
-            P_mat = np.vstack(p_mat_list) # aka Interaction Matrix, im
-            
-            rec_tomo = np.linalg.pinv(P_mat,rcond=0.05) # aka W, 5x(2*nstars)    
 
-            vx = np.asarray(aCartPointingCoordsV[:,0])
-            vy = np.asarray(aCartPointingCoordsV[:,1])
-            R_1 = np.zeros((2*npointings, 2*nstars))
-            for k in range(npointings):
-                P_alpha1 = P_func(vx[k]*arcsecsToRadians, vy[k]*arcsecsToRadians)
-                R_1[2*k:2*(k+1), :] = cp.dot(P_alpha1, rec_tomo)
+        P, P_func = self.specializedIM()
+        p_mat_list = []
+        for ii in range(nstars):
+            p_mat_list.append(P_func(aCartNGSCoords[ii,0]*arcsecsToRadians, aCartNGSCoords[ii,1]*arcsecsToRadians))
+        P_mat = np.vstack(p_mat_list) # aka Interaction Matrix, im
 
-            return R_1, R_1.transpose()
-    
+        if self.MMSE_Rec_LO:
+            # MMSE reconstructor
+            if Cnn is None and Caa is None:
+                raise ValueError('Cnn and Caa must be defined when MMSE_Rec_LO is True!')
+            # Calculate noise covariance matrix from diagonal elements of Caa
+            # for 5 modes, tip, tilt, focus, and 2 astigmatisms.
+            # We consider a ratio of 3 between tilt and higher order modes (focus, astigmatisms)
+            first_order_variance = np.mean([Caa[0,0], Caa[1,1]])  # Average of tip and tilt variances
+            second_order_variance = first_order_variance / 3.0
+            v_modes = np.array([
+                first_order_variance,             # tip
+                first_order_variance,             # tilt
+                second_order_variance,            # focus
+                second_order_variance,            # astigmatism 0 deg
+                second_order_variance             # astigmatism 45 deg
+            ])
+            Cx = np.diag(v_modes)
+            # MMSE estimator: W = Cx * A^T * (A * Cx * A^T + Cz)^-1
+            H = P_mat @ Cx @ P_mat.T + Cnn
+            rec_tomo = Cx @ P_mat.T @ np.linalg.pinv(H) # aka W, 5x(2*nstars)
+        else:
+            # Tikhonov regularization
+            lambda_tikhonov = 0.05
+            A = P_mat.T @ P_mat + lambda_tikhonov * np.eye(P_mat.shape[1])
+            b = P_mat.T
+            rec_tomo = np.linalg.solve(A, b) # aka W, 5x(2*nstars)
+
+        vx = np.asarray(aCartPointingCoordsV[:,0])
+        vy = np.asarray(aCartPointingCoordsV[:,1])
+        R_1 = np.zeros((2*npointings, 2*nstars))
+        for k in range(npointings):
+            P_alpha1 = P_func(vx[k]*arcsecsToRadians, vy[k]*arcsecsToRadians)
+            R_1[2*k:2*(k+1), :] = cp.dot(P_alpha1, rec_tomo)
+
+        return R_1, R_1.transpose()
+
     def compute2DMeanVar(self, aFunction, expr0, gaussianPointsM, expr1):
         gaussianPoints = gaussianPointsM.flatten()
         aIntegral = sp.Integral(aFunction, (getSymbolByName(aFunction, 'z_r'), self.zmin, self.zmax), (getSymbolByName(aFunction, 'i_p'), 1, int(self.imax)) )
@@ -668,25 +838,25 @@ class MavisLO(object):
         return mu_ktr_array, var_ktr_array, sigma_ktr_array
 
 
-    def computeBiasAndVariance(self, aNGS_flux, aNGS_freq, aNGS_EE, aNGS_FWHM_mas, doLO=True):
+    def computeBiasAndVariance(self, aNGS_flux, aNGS_freq, aNGS_EE, aNGS_FWHM_mas, PixelScale, doLO=True):
         if doLO:
             if self.WindowRadiusWCoG_LO == 0:
-                WindowRadiusWCoG = max(int(np.ceil((aNGS_FWHM_mas/2)/self.PixelScale_LO)),1)
+                WindowRadiusWCoG = max(int(np.ceil((aNGS_FWHM_mas/2)/PixelScale)),1)
             else:
                 WindowRadiusWCoG = self.WindowRadiusWCoG_LO
-            self.mediumPixelScale = self.PixelScale_LO/self.downsample_factor
+            self.mediumPixelScale = PixelScale/self.downsample_factor
         else:
             if self.WindowRadiusWCoG_Focus == 0:
-                WindowRadiusWCoG = max(int(np.ceil((aNGS_FWHM_mas/2)/self.PixelScale_Focus)),1)
+                WindowRadiusWCoG = max(int(np.ceil((aNGS_FWHM_mas/2)/PixelScale)),1)
             else:
                 WindowRadiusWCoG = self.WindowRadiusWCoG_Focus
-            self.mediumPixelScale = self.PixelScale_Focus/self.downsample_factor
+            self.mediumPixelScale = PixelScale/self.downsample_factor
         self.smallGridSize = 2*WindowRadiusWCoG
 
         # aNGS_flux is provided in photons/s
         aNGS_frameflux = aNGS_flux / aNGS_freq
         asigma = aNGS_FWHM_mas/sigmaToFWHM/self.mediumPixelScale
-  
+
         g2d = simple2Dgaussian( self.xLargeGrid, self.yLargeGrid, 0, 0, asigma)
         g2d = g2d * 1 / np.sum(g2d)
         I_k_data = g2d * aNGS_EE # Encirceld Energy in double FWHM is used to scale the PSF model
@@ -705,12 +875,13 @@ class MavisLO(object):
         (fx, fy) = np.meshgrid(ffx, ffx)
         # binary mask
         W_Mask = np.where( np.logical_or(fx**2 +fy**2 > WindowRadiusWCoG**2, fx**2 + fy**2 < 0**2), 0.0, 1.0)
-        ii1, ii2 = int(self.mediumGridSize/2-self.smallGridSize), int(self.mediumGridSize/2+self.smallGridSize)
-        I_k_data = I_k_data[ii1:ii2,ii1:ii2]
-        I_k_prime_data = I_k_prime_data[ii1:ii2,ii1:ii2]
-        W_Mask = W_Mask[ii1:ii2,ii1:ii2]
-        fx = fx[ii1:ii2,ii1:ii2]
-        fy = fy[ii1:ii2,ii1:ii2]
+        if self.smallGridSize < self.mediumGridSize/2:
+            ii1, ii2 = int(self.mediumGridSize/2-self.smallGridSize), int(self.mediumGridSize/2+self.smallGridSize)
+            I_k_data = I_k_data[ii1:ii2,ii1:ii2]
+            I_k_prime_data = I_k_prime_data[ii1:ii2,ii1:ii2]
+            W_Mask = W_Mask[ii1:ii2,ii1:ii2]
+            fx = fx[ii1:ii2,ii1:ii2]
+            fy = fy[ii1:ii2,ii1:ii2]
         mu_ktr_array, var_ktr_array, sigma_ktr_array = self.meanVarSigma(I_k_data, doLO=doLO)
         mu_ktr_prime_array, var_ktr_prime_array, sigma_ktr_prime_array = self.meanVarSigma(I_k_prime_data, doLO=doLO)
         masked_mu0 = W_Mask * mu_ktr_array
@@ -726,33 +897,41 @@ class MavisLO(object):
 
         return (bias,(mux,muy),(varx,vary))
 
-    @lru_cache(maxsize=None)
+    @method_lru_cache(maxsize=None)
     def _compute_turb_psds_cached(self, fmin, fmax, freq_samples, wind_speed, telescope_diameter, r0_value, l0):
         paramAndRange = ('f', fmin, fmax, freq_samples, 'linear')
         scaleFactor = (500 / 2.0 / np.pi) ** 2  # from rad**2 to nm**2
+        # scale the integration points with the number of points in the frequency range
+        psdIntegrationPoints = round(self.max_freq_turb/100*self.psdIntegrationPoints)
 
-        xplot1, zplot1 = self.mIt.IntegralEvalE(self.sTurbPSDTip, [paramAndRange], [(self.psdIntegrationPoints, 'linear')], 'rect')
+        xplot1, zplot1 = self.mIt.IntegralEvalE(self.sTurbPSDTip, [paramAndRange], [(psdIntegrationPoints, 'geometric')], 'trap_scaled')
         psd_freq = xplot1[0]
         psd_tip_turb = zplot1 * scaleFactor
 
-        xplot1, zplot1 = self.mIt.IntegralEvalE(self.sTurbPSDTilt, [paramAndRange], [(self.psdIntegrationPoints, 'linear')], 'rect')
+        xplot1, zplot1 = self.mIt.IntegralEvalE(self.sTurbPSDTilt, [paramAndRange], [(psdIntegrationPoints, 'geometric')], 'trap_scaled')
         psd_tilt_turb = zplot1 * scaleFactor
 
         return psd_tip_turb, psd_tilt_turb
 
-    def computeTurbPSDs(self, fmin, fmax, freq_samples):
+    def computeTurbPSDs(self, fmin, fmax, freq_samples):        
+        wind_speed = float(np.round(self.WindSpeed, 3))
+        telescope_diameter = float(np.round(self.TelescopeDiameter, 3))
+        r0_value = float(np.round(self.r0_Value, 6))
+        l0 = float(np.round(self.L0, 3))
+
         # Pass the parameters to the cached function
         return self._compute_turb_psds_cached(
-            fmin, fmax, freq_samples,
-            self.WindSpeed, self.TelescopeDiameter, self.r0_Value, self.L0
+            fmin, fmax, int(freq_samples), wind_speed, telescope_diameter, r0_value, l0
         )
 
-    @lru_cache(maxsize=None)
+    @method_lru_cache(maxsize=None)
     def _compute_focus_psds_cached(self, fmin, fmax, freq_samples, wind_speed, telescope_diameter, r0_value, l0, zenith_angle):
         paramAndRange = ('f', fmin, fmax, freq_samples, 'linear')
         scaleFactor = (500 / 2.0 / np.pi) ** 2  # from rad**2 to nm**2
+        # scale the integration points with the number of points in the frequency range
+        psdIntegrationPoints = round(self.max_freq_turb/100*self.psdIntegrationPoints)
 
-        xplot1, zplot1 = self.mIt.IntegralEvalE(self.sTurbPSDFocus, [paramAndRange], [(self.psdIntegrationPoints, 'linear')], 'rect')
+        xplot1, zplot1 = self.mIt.IntegralEvalE(self.sTurbPSDFocus, [paramAndRange], [(psdIntegrationPoints, 'geometric')], 'trap_scaled')
         psd_freq = xplot1[0]
         psd_focus_turb = zplot1 * scaleFactor
 
@@ -762,10 +941,15 @@ class MavisLO(object):
         return psd_focus_turb, psd_focus_sodium
 
     def computeFocusPSDs(self, fmin, fmax, freq_samples):
+        wind_speed = float(np.round(self.WindSpeed, 3))
+        telescope_diameter = float(np.round(self.TelescopeDiameter, 3))
+        r0_value = float(np.round(self.r0_Value, 6))
+        l0 = float(np.round(self.L0, 3))
+        zenith_angle = float(np.round(self.ZenithAngle, 3))
+
         # Pass the parameters to the cached function
         return self._compute_focus_psds_cached(
-            fmin, fmax, freq_samples,
-            self.WindSpeed, self.TelescopeDiameter, self.r0_Value, self.L0, self.ZenithAngle
+            fmin, fmax, int(freq_samples), wind_speed, telescope_diameter, r0_value, l0, zenith_angle
         )
 
     def checkStability(self,keys,values,TFeq):
@@ -870,19 +1054,19 @@ class MavisLO(object):
                 # if gain is set no optimization is done and bias is not compensated
                 g0 = (bias*self.LoopGain_LO,bias*self.LoopGain_LO)
                 g0g = xp.asarray(g0)
-            
+
             g0g_tip = g0g
             g0g_tilt = g0g
-        
+
             e1 = psd_freq.reshape((1,psd_freq.shape[0]))
             e2 = psd_tip_turb.reshape((1,psd_tip_turb.shape[0]))
             e3 = psd_tilt_turb.reshape((1,psd_tilt_turb.shape[0]))
             e4 = g0g.reshape((g0g.shape[0], 1))
             psd_freq_ext, psd_tip_turb_ext, psd_tilt_turb_ext, g0g_ext = xp.broadcast_arrays(e1, e2, e3, e4)
-            
+
             resultTip = xp.absolute((xp.sum(self.fTipS_lambda1( g0g_ext, psd_freq_ext, psd_tip_turb_ext), axis=(1)) ) )
             resultTilt = xp.absolute((xp.sum(self.fTiltS_lambda1( g0g_ext, psd_freq_ext, psd_tilt_turb_ext), axis=(1)) ) )
-               
+
         if self.plot4debug:
             fig, ax2 = plt.subplots(1,1)
             for x in range(g0g.shape[0]):
@@ -1064,22 +1248,22 @@ class MavisLO(object):
             g0 = (0.00000001,0.0000001,0.000001,0.00001,0.0001,0.001)
             maxG = maxStableGain(self.loopDelaySteps_LO)*0.8
             g0g_coarse = xp.concatenate((xp.asarray(g0), xp.linspace(0.01, maxG, npoints)))
-            
+
             e1 = psd_freq.reshape((1,psd_freq.shape[0]))
             e2 = psd_tip_wind.reshape((1,psd_tip_wind.shape[0]))
             e3 = psd_tilt_wind.reshape((1,psd_tilt_wind.shape[0]))
             e4 = g0g_coarse.reshape((g0g_coarse.shape[0], 1))
             psd_freq_ext, psd_tip_wind_ext, psd_tilt_wind_ext, g0g_ext = xp.broadcast_arrays(e1, e2, e3, e4)
-            
+
             resultTip_coarse = xp.absolute((xp.sum(self.fTipS_lambda1(g0g_ext, psd_freq_ext, psd_tip_wind_ext), axis=(1))))
             resultTilt_coarse = xp.absolute((xp.sum(self.fTiltS_lambda1(g0g_ext, psd_freq_ext, psd_tilt_wind_ext), axis=(1))))
-            
+
             minTipIdx_coarse = xp.where(resultTip_coarse == xp.nanmin(resultTip_coarse))
             minTiltIdx_coarse = xp.where(resultTilt_coarse == xp.nanmin(resultTilt_coarse))
-            
+
             bestTipGain_coarse = g0g_coarse[minTipIdx_coarse[0][0]]
             bestTiltGain_coarse = g0g_coarse[minTiltIdx_coarse[0][0]]
-            
+
             # Step 2: Fine search around the coarse minimum
             fine_range = 0.1 * maxG
             g0g_tip = xp.linspace(max(0, bestTipGain_coarse - fine_range), min(maxG, bestTipGain_coarse + fine_range), npoints)
@@ -1100,10 +1284,10 @@ class MavisLO(object):
                 # if gain is set no optimization is done and bias is not compensated
                 g0 = (bias*self.LoopGain_LO,bias*self.LoopGain_LO)
                 g0g = xp.asarray(g0)
-            
+
             g0g_tip = g0g
             g0g_tilt = g0g
-        
+
             e1 = psd_freq.reshape((1,psd_freq.shape[0]))
             e2 = psd_tip_wind.reshape((1,psd_tip_wind.shape[0]))
             e3 = psd_tilt_wind.reshape((1,psd_tilt_wind.shape[0]))
@@ -1122,13 +1306,13 @@ class MavisLO(object):
             ax2.set_title('residual wind PSD', color='black')
             ax2.set_xlabel('frequency [Hz]')
             ax2.set_ylabel('Power')
-                
+
         minTipIdx = xp.where(resultTip == xp.nanmin(resultTip))
         minTiltIdx = xp.where(resultTilt == xp.nanmin(resultTilt))
-        
+
         if self.verbose:
             print('    best tip & tilt gain (wind)',"%.3f" % cpuArray(g0g_tip[minTipIdx[0][0]]), "%.3f" % cpuArray(g0g_tilt[minTiltIdx[0][0]]))
-                    
+
         if self.platformlib==gpulib and gpuEnabled:
             return cp.asnumpy(resultTip[minTipIdx[0][0]]), cp.asnumpy(resultTilt[minTiltIdx[0][0]])
         else:
@@ -1137,19 +1321,21 @@ class MavisLO(object):
     def covValue(self, ii,jj, pp, hh):
         p =sp.symbols('p', real=False)
         h =sp.symbols('h', positive=True)
+        # scale integration points with the max spatial frequency value
+        integrationPoints = round(self.max_freq_cov/10*self.integrationPoints)
         #    with self.mutex:
         xplot1, zplot1 = self.mItcomplex.IntegralEval(sp.Function('C_v')(p, h),
                                                       self.specializedCovExprs[ii+10*jj],
                                                       [('p', pp , 0, 0, 'provided'), ('h', hh , 0, 0, 'provided')],
-                                                      [(self.integrationPoints, 'linear')],
-                                                      method='raw')
+                                                      [(integrationPoints, 'geometric')],
+                                                      method='trap_scaled')
 
         return np.real(np.asarray(zplot1))
 
 
     def computeCovMatrices(self, aCartPointingCoords, aCartNGSCoords, xp=np):
         points = aCartPointingCoords.shape[0]
-        nstars = aCartNGSCoords.shape[0]        
+        nstars = aCartNGSCoords.shape[0]
         scaleF = (500.0/(2*np.pi))**2
         matCaaValue = xp.zeros((2,2), dtype=xp.float32)
         matCasValue = xp.zeros((2*points,2*nstars), dtype=xp.float32)
@@ -1180,7 +1366,7 @@ class MavisLO(object):
                 pp = polarPointingCoordsD[0]*xp.exp(1j*polarPointingCoordsD[1])
                 inputsArray[nstars*points+iidd] = pp
                 iidd = iidd+1
-        
+
         _idx0 = {2:np.arange(0, 2*nstars, 2), 3:np.arange(1, 2*nstars, 2)}
 
         for ii in [2,3]:
@@ -1227,7 +1413,7 @@ class MavisLO(object):
                 pp = polarPointingCoordsD[0]*xp.exp(1j*polarPointingCoordsD[1])
                 inputsArray[nstars*points+iidd] = pp
                 iidd = iidd+1
-        
+
         _idx0 = {4:np.arange(0, nstars, 1)}
 
         for ii in [4]:
@@ -1246,8 +1432,8 @@ class MavisLO(object):
         xp = np
         points = aCartPointingCoordsV.shape[0]
         Ctot = np.zeros((2*points,2))
-        R, RT = self.buildReconstuctor2(aCartPointingCoordsV, aCartNGSCoords)
         Caa, Cas, Css = self.computeCovMatrices(xp.asarray(aCartPointingCoordsV), xp.asarray(aCartNGSCoords), xp=np)
+        R, RT = self.buildReconstuctor2(aCartPointingCoordsV, aCartNGSCoords, Cnn=aCnn, Caa=Caa)
         for i in range(points):
             Ri = R[2*i:2*(i+1),:]
             RTi = RT[:, 2*i:2*(i+1)]
@@ -1256,7 +1442,7 @@ class MavisLO(object):
             C3 = xp.dot(Ri, xp.dot(xp.asarray(aCnn), RTi))
             # tomography (C2), noise (C3), wind (aC1) errors
             if self.noNoise:
-                ss = xp.asarray(aC1) + Caa + C2b 
+                ss = xp.asarray(aC1) + Caa + C2b
                 print('    WARNING: LO noise is not active!')
             else:
                 ss = xp.asarray(aC1) + Caa + C2b + C3
@@ -1267,15 +1453,15 @@ class MavisLO(object):
                       '(', "%.2f" % np.sqrt(np.trace(Caa + C2b)), ',', "%.2f" % np.sqrt(np.trace(C3)), ',', "%.2f" % np.sqrt(np.trace(aC1)),')')
         return Ctot
 
-        
+
     def CMatAssemble(self, aCartPointingCoordsV, aCartNGSCoords, aCnn, aC1):
         R, RT = self.buildReconstuctor2(np.asarray(aCartPointingCoordsV), aCartNGSCoords)
-        Caa, Cas, Css = self.computeCovMatrices(np.asarray(aCartPointingCoordsV), aCartNGSCoords)        
+        Caa, Cas, Css = self.computeCovMatrices(np.asarray(aCartPointingCoordsV), aCartNGSCoords)
         C2 = Caa + np.dot(R, np.dot(Css, RT)) - np.dot(Cas, RT) - np.dot(R, Cas.transpose())
         C3 = np.dot(R, np.dot(aCnn, RT))
         # sum tomography (C2), noise (C3), wind (aC1) errors
         if self.noNoise:
-            ss = aC1 + C2
+            Ctot = aC1 + C2
             print('    WARNING: LO noise is not active!')
         else:
             Ctot = aC1 + C2 + C3
@@ -1286,21 +1472,19 @@ class MavisLO(object):
         return Ctot
 
     def multiFocusCMatAssemble(self, aCartNGSCoords, Cnn):
-        xp = np
         Caa, Cas, Css = self.computeFocusCovMatrices(np.asarray((0,0)), np.asarray(aCartNGSCoords), xp=np)
-        # NGS Rec. Mat. - MMSE estimator
+        # NGS Rec. Mat.
         IMt = np.array(np.repeat(1, aCartNGSCoords.shape[0]))
-        cov_turb_inv = np.array(1e-3) # the minimum ratio between turb. and noise cov. is 1e3 (this guarantees that the sum of the elements of R is 1).
-        cov_noise = np.diag(np.clip(np.diag(Cnn),np.max(Css)*1e-2,np.max(Cnn))/np.max(Cnn)) # it clips noise covariance when noise level is low
+        cov_noise = np.diag(np.clip(np.diag(Cnn),np.max(Cnn)*1e-2,np.max(Cnn))/np.max(Cnn)) # it clips noise covariance when noise level is low
         cov_noise_inv = np.linalg.pinv(cov_noise)
-        H = np.matmul(np.matmul(IMt,cov_noise_inv),np.transpose(IMt))
-        R = np.matmul(1/H*IMt,cov_noise_inv)
-        RT = R.transpose()
+        H = IMt @ cov_noise_inv @ IMt.T
+        R = 1/H * IMt @ cov_noise_inv
+        RT = RT = R.transpose()
         # sum tomography (Caa,Cas,Css) and noise (Cnn) errors for a on-axis star
         C2 = Caa + np.dot(R, np.dot(Css, RT)) - np.dot(Cas, RT) - np.dot(R, Cas.transpose())
         C3 = np.dot(R, np.dot(Cnn, RT))
 
-        return C2, C3 
+        return C2, C3
 
     def computeTotalResidualMatrixI(self, indices, aCartPointingCoords, aCartNGSCoords, aNGS_flux):
         nPointings = aCartPointingCoords.shape[0]
@@ -1351,19 +1535,26 @@ class MavisLO(object):
 
         if self.verbose:
             print('mavisLO.computeTotalResidualMatrix')
-            
+
         for starIndex in range(nNaturalGS):
             self.configLOFreq( aNGS_freq[starIndex] )
             if nNaturalGS != len(self.NumberLenslets):
+                # this is required for the case of asterism selection
                 NumberLenslets = self.NumberLenslets[0]
                 N_sa_tot_LO = self.N_sa_tot_LO[0]
+                PixelScale_LO = self.PixelScale_LO[0]
             else:
                 NumberLenslets = self.NumberLenslets[starIndex]
                 N_sa_tot_LO = self.N_sa_tot_LO[starIndex]
+                PixelScale_LO = self.PixelScale_LO[starIndex]
+            if self.verbose:
+                print('star number:', starIndex+1, 'over', nNaturalGS)
+                print('    Number of SA:', N_sa_tot_LO)
             # one scalar (bias), two tuples of 2 (amu, avar)
-            bias, amu, avar = self.computeBiasAndVariance(aNGS_flux[starIndex], aNGS_freq[starIndex], aNGS_EE[starIndex], aNGS_FWHM_mas[starIndex])
+            bias, amu, avar = self.computeBiasAndVariance(aNGS_flux[starIndex], aNGS_freq[starIndex], aNGS_EE[starIndex], aNGS_FWHM_mas[starIndex],
+                                                          PixelScale_LO)
             # conversion from pixel2 to mas2
-            var1x = avar[0] * self.PixelScale_LO**2
+            var1x = avar[0] * PixelScale_LO**2
             # noise propagation coefficient on tip/tilt is normalized by the number of sub-apertures
             var1x /= N_sa_tot_LO
 
@@ -1380,8 +1571,16 @@ class MavisLO(object):
                 #   empirical expression:
                 #   aliasing on TT is 4 times the linear increase of the difference
                 #   between FWHM of the PSF and the FWHM of the DL PSF
-                if aNGS_FWHM_mas[starIndex]-aNGS_FWHM_DL_mas > 0:
-                    aliasRMS = 4*(aNGS_FWHM_mas[starIndex]-aNGS_FWHM_DL_mas)
+                if isinstance(aNGS_FWHM_DL_mas, (list, tuple)):
+                    if nNaturalGS != len(self.NumberLenslets):
+                        # this is required for the case of asterism selection
+                        FWHM_DL_mas = aNGS_FWHM_DL_mas[0]
+                    else:
+                        FWHM_DL_mas = aNGS_FWHM_DL_mas[starIndex]
+                else:
+                    FWHM_DL_mas = aNGS_FWHM_DL_mas
+                if aNGS_FWHM_mas[starIndex]-FWHM_DL_mas > 0:
+                    aliasRMS = 4*(aNGS_FWHM_mas[starIndex]-FWHM_DL_mas)
                 else:
                     aliasRMS = 0.1
                 # conversion in nm RMS
@@ -1437,9 +1636,9 @@ class MavisLO(object):
                 print('    NGS (focus sensor) coordinates [arcsec] : ', ("{:.1f}, "*len(aCartNGSCoords[starIndex])).format(*aCartNGSCoords[starIndex]))
                 print('    turb. + noise residual (per NGS) [nm\u00b2]:',np.array(nr))
             Cnn[starIndex,starIndex] = nr
-            
+
         C2, C3 = self.multiFocusCMatAssemble( aCartNGSCoords, Cnn)
-            
+
         # difference
         CtotDiff = C2 + C3  - self.CtotL
 
@@ -1450,26 +1649,29 @@ class MavisLO(object):
         self.amuF = []
         self.avarF = []
         self.nrF = []
-        
+
         maxFluxIndex = np.where(aNGS_flux==np.amax(aNGS_flux))
         nNaturalGS = aCartNGSCoords.shape[0]
         Cnn = np.zeros((nNaturalGS,nNaturalGS))
-        
+
         if self.verbose:
             print('mavisLO.computeFocusTotalResidualMatrix')
-            
+
         for starIndex in range(nNaturalGS):
             self.configFocusFreq( aNGS_freq[starIndex] )
             if nNaturalGS != len(self.NumberLenslets_Focus):
                 NumberLenslets = self.NumberLenslets_Focus[0]
                 N_sa_tot_Focus = self.N_sa_tot_Focus[0]
+                PixelScale_Focus = self.PixelScale_Focus[0]
             else:
                 NumberLenslets = self.NumberLenslets_Focus[starIndex]
                 N_sa_tot_Focus = self.N_sa_tot_Focus[starIndex]
+                PixelScale_Focus = self.PixelScale_Focus[starIndex]
             # one scalar (bias), two tuples of 2 (amu, avar)
-            bias, amu, avar = self.computeBiasAndVariance(aNGS_flux[starIndex], aNGS_freq[starIndex], aNGS_EE[starIndex], aNGS_FWHM_mas[starIndex], doLO=False)
+            bias, amu, avar = self.computeBiasAndVariance(aNGS_flux[starIndex], aNGS_freq[starIndex], aNGS_EE[starIndex], aNGS_FWHM_mas[starIndex],
+                                                          PixelScale_Focus, doLO=False)
             # conversion from pixel2 to mas2
-            var1x = avar[0] * self.PixelScale_Focus**2
+            var1x = avar[0] * PixelScale_Focus**2
             # noise propagation coefficient on tip/tilt is normalized by the number of sub-apertures
             var1x /= N_sa_tot_Focus
 
@@ -1503,10 +1705,10 @@ class MavisLO(object):
         CaaL, CasL, CssL = self.computeFocusCovMatrices(np.asarray((0,0)), np.asarray(aCartLGSCoords), xp=np)
         # tomography error for a on-axis star for LGS WFSs
         self.CtotL = CaaL + np.dot(RL, np.dot(CssL, RLT)) - np.dot(CasL, RLT) - np.dot(RL, CasL.transpose())
-        
+
         if doAll:
             C2, C3 = self.multiFocusCMatAssemble(aCartNGSCoords, Cnn)
-            
+
             # difference
             CtotDiff = C2 + C3 - self.CtotL
 
@@ -1537,7 +1739,7 @@ class MavisLO(object):
                 CC[1,0] = 1e-20
             if np.abs(CC[0,1]) < 1e-20:
                 CC[0,1] = 1e-20
-            
+
             th = leq1(CC[0,0], CC[1,1], CC[1,0])        
             s1 = leq2(CC[0,0], CC[1,1], CC[1,0], th)
             s2 = leq3(CC[0,0], CC[1,1], s1)
@@ -1548,7 +1750,7 @@ class MavisLO(object):
             else:
                 smax = s1
                 smin = s2
-            scale = (np.pi/(180*3600*1000) * self.TelescopeDiameter / (4*1e-9))        
+            scale = (np.pi/(180*3600*1000) * self.TelescopeDiameter / (4*1e-9))
             return th, np.sqrt(smax)/scale, np.sqrt(smin)/scale
 
         def computeCovEllispses(Ctot):
@@ -1561,9 +1763,9 @@ class MavisLO(object):
 
         return computeCovEllispses(Ctot)
 
-    
+
 #        if not mono and nPointings>1:
-#            # while C2 and C3 do        
+#            # while C2 and C3 do 
 #            inputs = aCartPointingCoords.tolist()
 #            pool_size = int( min( mp.cpu_count()/2, nPointings) )
 #            semaphore = mp.Semaphore()
@@ -1575,7 +1777,7 @@ class MavisLO(object):
 #        else:
 
 #    def initializer(self, semaphore):
-#        """This function is run at the Pool startup. 
+#        """This function is run at the Pool startup.
 #        Use it to set your Semaphore object in the child process.#
 #
 #        """

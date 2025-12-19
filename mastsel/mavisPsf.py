@@ -217,14 +217,23 @@ class Field(object):
         self.unit = 'rad'
         self.width = new_pixel_size * self.N
 
-    def pupilToOtf(self):
-        self.sampling = self.xp.real(
+    def pupilToMtf(self):
+        self.sampling = self.xp.abs(
             ft_ft2(
                 self.xp.square(
                     self.xp.absolute(
                         ft_ift2(
                             self.sampling,
                             self.xp)))) )
+
+    def pupilToOtf(self):
+        self.sampling = ft_ft2(
+                self.xp.square(
+                    self.xp.absolute(
+                        ft_ift2(
+                            self.sampling,
+                            self.xp))))
+
     def FWHM(self):
         if self.N <= fit_window_max_size:
             s1 = self.sampling
@@ -327,8 +336,8 @@ def convolve(psf, kernel, xp=defaultArrayBackend, skip_norm=False):
     xp = psf.xp
     if (psf.N != kernel.N):
         print('psf and kernel sampling not compatible (grids sizes in pixels are different!)')
-        print('psf.N:', psf.N) 
-        print('kernel.N:', kernel.N) 
+        print('psf.N:', psf.N)
+        print('kernel.N:', kernel.N)
         return
 #    if xp.abs((psf.pixel_size - kernel.pixel_size)) > 0.001:
 #        print('These values should be the same!!!')
@@ -383,16 +392,16 @@ def longExposurePsf(mask, psd, otf_tel = None):
     p_final_psf = mask.wvl / (pitch * mask.N)  # rad
     result = Field(mask.wvl, mask.N, psd.N * p_final_psf, unit='rad')
     ################################################
-    
+
     # step 0 : compute telescope otf
     if otf_tel is None:
         maskC = Field(mask.wvl, mask.N, pitch*mask.N)
         maskC.sampling = xp.copy(mask.sampling)
         maskC.pupilToOtf()
         otf_tel = maskC.sampling
-    
+
     psd.sampling = zeroPad(psd.sampling, psd.sampling.shape[0]//2)
-    
+
     # step 1 : compute phase autocorrelation
     B_phi = xp.real(xp.fft.ifft2(xp.fft.ifftshift(psd.sampling))) * (psd.kk * freq_range) ** 2
     b0 = B_phi[0, 0]
@@ -401,9 +410,9 @@ def longExposurePsf(mask, psd, otf_tel = None):
     # step 2 : compute structure function
     # D_phi = 2.0 * (-B_phi + b0)
     D_phi = 2.0 * b0 - (B_phi + B_phi.conj())
-        
+
     # step 3 : compute turbolence otf
-    otf_turb = xp.exp(-0.5 * (D_phi))    
+    otf_turb = xp.exp(-0.5 * (D_phi))
     # p_otft_turb = pitch
     otf_turb = congrid(otf_turb, [otf_turb.shape[0]//2, otf_turb.shape[0]//2])
 
@@ -458,7 +467,8 @@ def maskSA(nSA, nMask, telPupil):
     return mask
 
 def psdSetToPsfSet(inputPSDs, mask, wavelength, N, nPixPup, grid_diameter, freq_range,
-                   dk, nPixPsf, wvlRef, oversampling, opdMap=None, padPSD=False):
+                   dk, nPixPsf, wvlRef, oversampling, opdMap=None, padPSD=False,
+                   skip_reshape=False):
 
     wavelength = np.atleast_1d(wavelength)  # Assicura che sia un array
     multi_wave = len(wavelength) > 1
@@ -531,7 +541,7 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength, N, nPixPup, grid_diameter, freq_
             if nBig > psfLE.N:
                 psfLE.sampling = zeroPad(psfLE.sampling, (nBig-psfLE.N)//2)
             # resample the PSF to get the not oversampled pixel scale
-            if ovrsmp > 1:
+            if ovrsmp > 1 and not skip_reshape:
                 nOvr = int(ovrsmp)
                 nOut = int(psfLE.sampling.shape[0] / nOvr)
 
