@@ -600,13 +600,42 @@ def _exact_block_decimate(sampling, nPixPsf, xp):
     return sampling.reshape(n_out, k, n_out, k).sum(axis=(1, 3))
 
 
+def _resample_full_flux(sampling, zoom_factor, n_out, xp, transform):
+    """Resample complete support to unit power, then take the requested field."""
+    if not np.isfinite(zoom_factor) or zoom_factor <= 0 or n_out <= 0:
+        raise ValueError('Full-flux resampling requires positive sampling and field size.')
+    if abs(zoom_factor - 1.0) <= 1e-6:
+        return _pad_or_crop_centered(sampling, n_out, xp=xp)
+
+    n_full = max(2, 2 * int(np.ceil(sampling.shape[0] * zoom_factor / 2)))
+    scale = 1.0 / zoom_factor
+    offset = sampling.shape[0] // 2 - (n_full // 2) * scale
+    complete = transform(
+        sampling, matrix=xp.asarray([scale, scale], dtype=defaultArrayDtype),
+        offset=[offset, offset], output_shape=(n_full, n_full),
+        order=1, mode='constant', cval=0.0,
+    )
+    power = float(complete.sum())
+    if not np.isfinite(power) or power <= 0:
+        raise ValueError('Full-flux resampling produced no positive finite power.')
+    complete /= power
+    return _pad_or_crop_centered(complete, n_out, xp=xp)
+
+
 def psdSetToPsfSet(inputPSDs, mask, wavelength,
                    N=None, nPixPup=None, grid_diameter=None, freq_range=None,
                    dk=None, nPixPsf=None, wvlRef=None, oversampling=1,
                    opdMap=None, padPSD=False, skip_reshape=False,
-                   internal_grid_mode='even_legacy', debug_trace=False):
+                   internal_grid_mode='even_legacy', debug_trace=False,
+                   full_flux=False):
     """
     Transforms a set of PSDs into PSFs.
+
+    full_flux=True returns pixel-integrated fractions of complete propagation
+    power. Interpolation is normalized on complete output support before
+    cropping; changing nPixPsf at fixed pixel scale cannot change overlapping
+    pixels. A crop can contain less than unit power. The default False retains
+    the existing amplitude and resampling behavior.
 
     Two calling conventions are supported, auto-detected from inputPSDs:
 
@@ -840,6 +869,12 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
             # Execute Fourier propagation at Native Scale
             psfLE = longExposurePsf(maskField, psd, otf_tel=otf_tel)
 
+            if full_flux:
+                native_flux = float(psfLE.sampling.sum())
+                if not np.isfinite(native_flux) or native_flux <= 0:
+                    raise ValueError('Full-flux propagation requires positive finite native power.')
+                psfLE.sampling /= native_flux
+
             if per_wavelength_psd:
                 # 5. EXACT INTEGER DECIMATION (flux-conserving, no interpolation)
                 if psfLE.N != int(nPixPsf):
@@ -856,7 +891,12 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                     psfLE.width = int(nPixPsf) * native_ps_rad * k
             else:
                 # 5. SPATIAL INTERPOLATION & CROP/PAD (Zero-Allocation VRAM optimization)
-                if abs(zoom_factor - 1.0) > 1e-6 or psfLE.N != int(nPixPsf):
+                if full_flux:
+                    psfLE.sampling = _resample_full_flux(
+                        psfLE.sampling, zoom_factor, int(nPixPsf), xp, a_affine_transform,
+                    )
+                    psfLE.width = int(nPixPsf) * target_ps_rad
+                elif abs(zoom_factor - 1.0) > 1e-6 or psfLE.N != int(nPixPsf):
 
                     # Measure total flux before interpolation
                     native_flux = float(psfLE.sampling.sum())
