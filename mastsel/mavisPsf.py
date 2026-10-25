@@ -396,7 +396,14 @@ def StrehlFromMask(psf, mask):
     return StrehlFromReference(psf, ref)
 
 
-def convolve(psf, kernel, xp=defaultArrayBackend):
+def convolve(psf, kernel, xp=defaultArrayBackend, *, normalize_input=True):
+    """Convolve a PSF with an OTF kernel, without mutating either input.
+
+    normalize_input=True retains the default division by the input image sum.
+    False leaves the input amplitude unchanged, so a unit-DC kernel conserves
+    its power. This is the appropriate choice for complete-plane normalized
+    PSFs whose retained crop may contain less than unit power.
+    """
     xp = psf.xp
     if (psf.N != kernel.N):
         print('psf and kernel sampling not compatible (grids sizes in pixels are different!)')
@@ -410,7 +417,8 @@ def convolve(psf, kernel, xp=defaultArrayBackend):
 #        return
     result = Field(psf.wvl, psf.N, psf.width, unit='m')
 
-    result.sampling = xp.real( KernelConvolve(psf.sampling/psf.sampling.sum(), kernel.sampling) )
+    sampling = psf.sampling / psf.sampling.sum() if normalize_input else psf.sampling
+    result.sampling = xp.real(KernelConvolve(sampling, kernel.sampling))
 
     result.sampling = centralSquare(result.sampling, int(psf.N), xp)
     if xp.__name__=='cupy':
