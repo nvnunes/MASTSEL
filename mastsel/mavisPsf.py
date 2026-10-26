@@ -635,7 +635,7 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                    dk=None, nPixPsf=None, wvlRef=None, oversampling=1,
                    opdMap=None, padPSD=False, skip_reshape=False,
                    internal_grid_mode='even_legacy', debug_trace=False,
-                   full_flux=False):
+                   full_flux=False, tip_tilt_removal='none', tilt_fit_pupil=None):
     """
     Transforms a set of PSDs into PSFs.
 
@@ -671,7 +671,22 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
               freq_range, dk, nPixPsf, oversampling.
     Legacy-only (accepted and ignored): N, grid_diameter, wvlRef, padPSD.
     skip_reshape=True sets oversampling=1 (backward-compatible shortcut).
+
+    tip_tilt_removal='pupil_fit' fits and removes two ramps from the Gaussian
+    residual and static phase on the original pupil before pupil-pair OTF
+    averaging. The default 'none' preserves native stationary optics; upstream
+    spectral filtering is performed by P3. tilt_fit_pupil optionally supplies
+    the full telescope pupil when mask describes subaperture optics. This mode
+    uses CPU integration on even_legacy grids and retains normal output scaling,
+    wavelength sampling and crop semantics. Returned Fields also carry the
+    pupil-weighted dynamic residual_phase_variance in radians squared.
+    The pair sum uses serial Numba acceleration when available with JIT enabled,
+    otherwise NumPy.
     """
+    if tip_tilt_removal not in ('none', 'pupil_fit'):
+        raise ValueError("tip_tilt_removal must be 'none' or 'pupil_fit'")
+    if tip_tilt_removal == 'pupil_fit' and internal_grid_mode != 'even_legacy':
+        raise ValueError('pupil_fit requires internal_grid_mode=even_legacy')
     wavelength = np.atleast_1d(wavelength)
     multi_wave = len(wavelength) > 1
 
@@ -850,12 +865,14 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                 otf_tel = maskOtf.sampling
 
         psfMultiWave = []
+        tilt_projector = None
+        coherent_pupil = None
 
         # 4. LOOP OVER PSDs AND GENERATE PSFs
         for i, computedPSD in enumerate(wvl_psds):
 
             if isinstance(mask, list):
-                maskField.sampling = congrid(mask[i], [nPixPup, nPixPup])
+                maskField.sampling = congrid(mask[i], [wvl_nPixPup, wvl_nPixPup])
                 maskField.sampling = _pad_or_crop_centered(maskField.sampling, n_internal, xp)
                 if opdMap is not None:
                     maskOtf.sampling = maskField.sampling * xp.exp(i_complex * phaseStat)
@@ -875,7 +892,27 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
             psd.sampling = psd_sampling
 
             # Execute Fourier propagation at Native Scale
-            psfLE = longExposurePsf(maskField, psd, otf_tel=otf_tel)
+            if tip_tilt_removal == 'pupil_fit':
+                from .pupil_tilt import _PupilTiltProjector
+                fit_mask = tilt_fit_pupil if tilt_fit_pupil is not None else (
+                    mask[i] if isinstance(mask, list) else mask)
+                if tilt_projector is None or (isinstance(mask, list) and tilt_fit_pupil is None):
+                    tilt_projector = _PupilTiltProjector(hostData(fit_mask), n_internal, wvl_nPixPup)
+                if coherent_pupil is None or isinstance(mask, list):
+                    coherent_pupil = np.asarray(hostData(maskField.sampling), dtype=np.complex128)
+                    if opdMap is not None:
+                        fit_phase = hostData(congrid(xp.asarray(opdMap) * (2 * np.pi * 1e-9 / wvl),
+                                                     tilt_projector.fit_shape))
+                        native_phase = tilt_projector.remove_static_tilt(hostData(phaseStat), fit_phase)
+                        coherent_pupil = coherent_pupil * np.exp(1j * native_phase)
+                phase_spectrum = np.fft.ifftshift(hostData(psd.sampling)) * (psd.kk * psd.width) ** 2 / 4
+                image, variance = tilt_projector.psf(phase_spectrum, coherent_pupil,
+                                                     normalize_static=opdMap is not None)
+                psfLE = Field(wvl, n_internal, wvl * psd.width, 'rad', xp=xp)
+                psfLE.sampling = xp.asarray(image, dtype=defaultArrayDtype)
+                psfLE.residual_phase_variance = variance
+            else:
+                psfLE = longExposurePsf(maskField, psd, otf_tel=otf_tel)
 
             if full_flux:
                 native_flux = float(psfLE.sampling.sum())
