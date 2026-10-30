@@ -10,6 +10,8 @@ No additional dependencies or global threading changes are required.
 import numpy as np
 from numpy import fft
 
+from .mavisPsf import pupilTiltFit
+
 try:
     from numba import config as _numba_config, njit as _njit
 except ImportError:
@@ -230,11 +232,7 @@ class _PupilTiltProjector:
     """
 
     def __init__(self, fit_pupil, n, pupil_pixels):
-        amplitude = np.asarray(fit_pupil, dtype=np.float64)
-        if (amplitude.ndim != 2 or amplitude.shape[0] != amplitude.shape[1]
-                or not np.all(np.isfinite(amplitude)) or np.any(amplitude < 0)
-                or not np.any(amplitude > 0)):
-            raise ValueError('Pupil tilt fitting requires a finite nonnegative square pupil')
+        self.fit = pupilTiltFit(fit_pupil)
         if n < 2 or n % 2 or pupil_pixels <= 0:
             raise ValueError('pupil_fit requires a positive even native optical grid')
         self.n = int(n)
@@ -242,16 +240,8 @@ class _PupilTiltProjector:
         # One compact support cache per projector; amplitudes and phase stay live.
         self._overlap_positions = None
         self._overlap_geometry = None
-        fine = amplitude.shape[0]
-        q = 2 * (np.arange(fine) - (fine - 1) / 2) / fine
-        x, y = np.meshgrid(q, q)
-        basis = np.stack((x, y))
-        weights = amplitude ** 2
-        gram = np.einsum('iyx,jyx,yx->ij', basis, basis, weights)
-        if np.linalg.cond(gram) > 1e12:
-            raise ValueError('Pupil does not constrain both fitted tilt modes')
-        self.fit = np.einsum('ij,jyx->iyx', np.linalg.inv(gram), basis) * weights
-        self.fit_shape = amplitude.shape
+        self.fit_shape = self.fit.shape[1:]
+        fine = self.fit_shape[0]
         positions = self.n / 2 - self.pupil_pixels / 2 + np.arange(fine) * self.pupil_pixels / fine
         transform = np.exp(2j * np.pi * np.fft.fftfreq(self.n)[:, None] * positions[None, :])
         self.kernels = np.asarray([transform @ fit @ transform.T / self.n ** 2 for fit in self.fit])

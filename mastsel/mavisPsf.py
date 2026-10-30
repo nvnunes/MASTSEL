@@ -133,6 +133,32 @@ def padOrCropCentered(input_grid, target_n, xp=defaultArrayBackend):
     return _pad_or_crop_centered(input_grid, target_n, xp)
 
 
+def pupilTiltFit(fit_pupil):
+    """Return intensity-weighted least-squares coefficients for two pupil tilts.
+
+    ``fit_pupil`` is a finite, real, nonnegative square pupil-amplitude array.
+    The returned NumPy float64 array has shape ``(2, n, n)``: contracting it
+    with a phase array on the same grid gives the x/y tilt coefficients in
+    that phase's units. Ramps use coordinates ``2*(j-(n-1)/2)/n`` on the
+    original pupil grid. No piston is fitted and the input is not modified.
+    Invalid pupils or pupils that do not constrain both ramps raise ValueError.
+    """
+    amplitude = np.asarray(fit_pupil, dtype=np.float64)
+    if (amplitude.ndim != 2 or amplitude.shape[0] != amplitude.shape[1]
+            or not np.all(np.isfinite(amplitude)) or np.any(amplitude < 0)
+            or not np.any(amplitude > 0)):
+        raise ValueError('Pupil tilt fitting requires a finite nonnegative square pupil')
+    fine = amplitude.shape[0]
+    q = 2 * (np.arange(fine) - (fine - 1) / 2) / fine
+    x, y = np.meshgrid(q, q)
+    basis = np.stack((x, y))
+    weights = amplitude ** 2
+    gram = np.einsum('iyx,jyx,yx->ij', basis, basis, weights)
+    if np.linalg.cond(gram) > 1e12:
+        raise ValueError('Pupil does not constrain both fitted tilt modes')
+    return np.einsum('ij,jyx->iyx', np.linalg.inv(gram), basis) * weights
+
+
 def _set_sampling_preserve_pixel_size(field, sampling):
     pixel_size = field.pixel_size
     field.sampling = sampling
