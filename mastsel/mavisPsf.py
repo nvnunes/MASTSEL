@@ -473,7 +473,21 @@ def shortExposurePsf(mask, phaseScreen):
     return result
 
 
-def longExposurePsf(mask, psd, otf_tel=None):
+def pixelOtf(n, pixel_ratio, xp=defaultArrayBackend):
+    """
+    Transfer function of a square detector pixel, sinc(p f_x) sinc(p f_y), on the
+    n x n OTF (lag) grid of longExposurePsf, centred at n//2.
+
+    With lag rho_j = (j - n//2) * pitch, f_j = rho_j / wvl and native PSF pixel
+    wvl / (pitch * n), the product p * f_j reduces to pixel_ratio * (j - n//2) / n,
+    where pixel_ratio = p / native PSF pixel: wavelength and pitch cancel out.
+    np.sinc is the normalized sinc, sin(pi x) / (pi x).
+    """
+    s = xp.sinc(pixel_ratio * (xp.arange(n) - n // 2) / n).astype(defaultArrayDtype)
+    return s[:, None] * s[None, :]
+
+
+def longExposurePsf(mask, psd, otf_tel=None, otf_pixel=None):
     xp = mask.xp
     if defaultArrayDtype == defaultArrayBackend.float32:
         dtype = xp.float32
@@ -545,6 +559,9 @@ def longExposurePsf(mask, psd, otf_tel=None):
 
     # step 4 : combine telescope and turbulence otfs
     otf_system = B_phi * otf_tel
+    if otf_pixel is not None:
+        # detector pixel integration: PSF * box  <->  OTF . sinc
+        otf_system *= otf_pixel
 
     # step 5 : system otf to system psf
     result.sampling = xp.real(ft_ft2(otf_system, xp))
@@ -710,7 +727,8 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                    dk=None, nPixPsf=None, wvlRef=None, oversampling=1,
                    opdMap=None, padPSD=False, skip_reshape=False,
                    internal_grid_mode='even_legacy', debug_trace=False,
-                   full_flux=False, tip_tilt_removal='none', tilt_fit_pupil=None):
+                   full_flux=False, tip_tilt_removal='none', tilt_fit_pupil=None,
+                   pixelResponse=False):
     """
     Transforms a set of PSDs into PSFs.
 
@@ -757,6 +775,19 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
     pupil-weighted dynamic residual_phase_variance in radians squared.
     The pair sum uses serial Numba acceleration when available with JIT enabled,
     otherwise NumPy.
+
+    pixelResponse=True integrates the PSF over the square output pixel: the
+    system OTF on the native grid is multiplied by the pixel transfer function
+    (see pixelOtf) before decimation/interpolation, so that the following point
+    sampling gives samples of PSF * box, aliasing included, also for output
+    sampling < 2. In the per-wavelength path this is exact when the native grid
+    is Nyquist sampled (native sampling >= 2, as P3 builds it with
+    k = ceil(2/samp)); below that the telescope OTF on the native grid is
+    circularly aliased and the product with the sinc is only approximate. The
+    legacy path adds its existing bilinear interpolation error (percent level
+    for a non-integer native/output ratio, with or without pixelResponse).
+    With full_flux=True, explicit pixel response replaces the per-wavelength
+    block sum. The default False keeps the existing sampling convention.
     """
     if tip_tilt_removal not in ('none', 'pupil_fit'):
         raise ValueError("tip_tilt_removal must be 'none' or 'pupil_fit'")
@@ -937,6 +968,16 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                 maskOtf.sampling /= maskOtf.sampling.max()
                 otf_tel = maskOtf.sampling
 
+        otf_pixel = None
+        pupil_fit_pixel_otf = None
+        if pixelResponse:
+            # output pixel / native pixel: k by construction (per-wavelength),
+            # target / native (legacy; non-integer in general)
+            pixel_ratio = n_internal // int(nPixPsf) if per_wavelength_psd else 1.0 / zoom_factor
+            otf_pixel = pixelOtf(n_internal, pixel_ratio, xp)
+            if tip_tilt_removal == 'pupil_fit':
+                pupil_fit_pixel_otf = np.fft.ifftshift(hostData(otf_pixel))
+
         psfMultiWave = []
         tilt_projector = None
         coherent_pupil = None
@@ -982,12 +1023,13 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                         coherent_pupil = coherent_pupil * np.exp(1j * native_phase)
                 phase_spectrum = np.fft.ifftshift(hostData(psd.sampling)) * (psd.kk * psd.width) ** 2 / 4
                 image, variance = tilt_projector.psf(phase_spectrum, coherent_pupil,
-                                                     normalize_static=opdMap is not None)
+                                                     normalize_static=opdMap is not None,
+                                                     otf_pixel=pupil_fit_pixel_otf)
                 psfLE = Field(wvl, n_internal, wvl * psd.width, 'rad', xp=xp)
                 psfLE.sampling = xp.asarray(image, dtype=defaultArrayDtype)
                 psfLE.residual_phase_variance = variance
             else:
-                psfLE = longExposurePsf(maskField, psd, otf_tel=otf_tel)
+                psfLE = longExposurePsf(maskField, psd, otf_tel=otf_tel, otf_pixel=otf_pixel)
 
             if full_flux:
                 native_flux = float(psfLE.sampling.sum())
@@ -1000,7 +1042,7 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                 if psfLE.N != int(nPixPsf):
                     native_flux = float(psfLE.sampling.sum()) if debug_trace else None
                     resampled = _exact_block_decimate(psfLE.sampling, nPixPsf, xp,
-                                                      integrate_pixels=full_flux)
+                                                      integrate_pixels=full_flux and not pixelResponse)
                     if debug_trace:
                         print(f"  [PSD {i}] Native Flux : {native_flux:.6e}")
                         print(f"  [PSD {i}] Output Flux : {float(resampled.sum()):.6e}")

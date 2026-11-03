@@ -303,14 +303,16 @@ class _PupilTiltProjector:
         coefficients = np.einsum('iyx,yx->i', self.fit, fit_phase)
         return np.asarray(native_phase) - np.einsum('i,iyx->yx', coefficients, self.ramps)
 
-    def psf(self, phase_spectrum, coherent_pupil, normalize_static=False):
+    def psf(self, phase_spectrum, coherent_pupil, normalize_static=False, *, otf_pixel=None):
         """Return native PSF pixels and pupil-weighted dynamic phase variance.
 
         ``phase_spectrum`` is an unshifted real-phase FFT spectrum: its inverse
         FFT is the covariance in radians squared. ``coherent_pupil`` includes
         the static phase after its fit has been removed. Output scaling matches
         native longExposurePsf: total pupil power without an OPD map, or N²
-        with the normalized static OTF. Subsequent full_flux handling is shared.
+        with the normalized static OTF. An optional unshifted detector OTF
+        multiplies the projected coherence before imaging. Subsequent
+        full_flux handling is shared.
         """
         power = np.asarray(phase_spectrum, dtype=np.float64)
         pupil = np.asarray(coherent_pupil, dtype=np.complex128)
@@ -338,6 +340,8 @@ class _PupilTiltProjector:
                                     ys, xs, amplitudes)
         pupil_power = float(np.sum(np.abs(amplitudes) ** 2))
         normalization = pupil_power if normalize_static else self.n ** 2
+        if otf_pixel is not None:
+            coherence *= otf_pixel
         image = fft.fftshift(fft.fft2(coherence)).real / normalization
         ramps = self.ramps[:, ys, xs]
         residual_variance = (covariance[0, 0] - 2 * np.sum(ramps * cross[:, ys, xs], axis=0)
