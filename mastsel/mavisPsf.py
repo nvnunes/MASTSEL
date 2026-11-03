@@ -1,14 +1,17 @@
 import numpy as np
 
+from mastsel.mavisUtilities import *
+from mastsel.mavisFormulas import *
+
+# After the star imports: they re-export SEEING's `cp`/`gpuEnabled` (through
+# SYMAO), which would otherwise override MASTSEL's own backend choice
+# (MASTSEL_DISABLE_GPU was ignored).
 from . import gpuEnabled
 
 if not gpuEnabled:
     cp = np
 else:
     import cupy as cp
-
-from mastsel.mavisUtilities import *
-from mastsel.mavisFormulas import *
 
 fit_window_max_size = 512
 defaultArrayBackend = cp
@@ -520,7 +523,15 @@ def longExposurePsf(mask, psd, otf_tel=None):
     xp.exp(B_phi, out=B_phi)
     
     target_n = otf_tel.shape[0]
-    if B_phi.shape[0] != target_n:
+    if B_phi.shape[0] in (2 * target_n, 2 * target_n - 1):
+        # The lag grid is twice as fine: keep every second sample around the
+        # centre (fftshift centre B.shape//2 -> target_n//2, as otf_tel). Same
+        # samples as congrid for even sizes; for odd sizes congrid resampled by
+        # (2N-1)/N and missed the centre (OTF off by half a pixel).
+        c = B_phi.shape[0] // 2
+        idx = c + 2 * xp.arange(-(target_n // 2), target_n - target_n // 2)
+        B_phi = B_phi[idx][:, idx]
+    elif B_phi.shape[0] != target_n:
         B_phi = congrid(B_phi, [target_n, target_n])
 
     # step 4 : combine telescope and turbulence otfs
@@ -534,7 +545,10 @@ def longExposurePsf(mask, psd, otf_tel=None):
 
 def residualToSpectrum(ellp, wvl, N,  pixel_scale_otf):
     convKernelFFT = Field(wvl, int(N), N*pixel_scale_otf, '')
-    convKernelFFT.setAsGaussianKernel(1/(2*np.pi*ellp[1]), 1/(2*np.pi*ellp[2]), -ellp[0])
+    # The Fourier transform of a Gaussian rotated by theta is rotated by the same
+    # theta: the angle must not change sign (with -theta the kernel was mirrored,
+    # e.g. an ellipse at +30 deg was applied at -30 deg).
+    convKernelFFT.setAsGaussianKernel(1/(2*np.pi*ellp[1]), 1/(2*np.pi*ellp[2]), ellp[0])
 
     return convKernelFFT
 
@@ -609,15 +623,11 @@ def _expand_odd_psd_to_even_with_zero_nyquist(psd, xp=defaultArrayBackend):
     return out
 
 
-def _exact_block_decimate(sampling, nPixPsf, xp):
-    """
-    Flux-conserving decimation by an exact integer factor: reshape the
-    (n_out*k, n_out*k) array into (n_out, k, n_out, k) blocks and sum over
-    the k x k sub-pixels. Unlike a bilinear resize, this is exact (no
-    interpolation error) and needs no post-hoc flux renormalization, because
-    summing block sums always reproduces the total sum of the input array.
-    It is also the physically correct model of a real detector pixel
-    integrating the flux over its area.
+def _exact_block_decimate(sampling, nPixPsf, xp, *, integrate_pixels=False):
+    """Decimate by an exact integer factor while preserving total power.
+
+    Ordinary output takes centred point samples and rescales their sum.
+    Full-flux output retains its pixel-integrated convention by summing blocks.
     """
     n_out = int(nPixPsf)
     n_in = sampling.shape[0]
@@ -631,7 +641,37 @@ def _exact_block_decimate(sampling, nPixPsf, xp):
             f"of nPixPsf for this wavelength."
         )
     k = n_in // n_out
-    return sampling.reshape(n_out, k, n_out, k).sum(axis=(1, 3))
+    if integrate_pixels:
+        return sampling.reshape(n_out, k, n_out, k).sum(axis=(1, 3))
+    idx = n_in // 2 + k * xp.arange(-(n_out // 2), n_out - n_out // 2)
+    out = sampling[idx][:, idx]
+    return out * (sampling.sum() / out.sum())
+
+
+def pupilOnGrid(a, n_pix_pup, n_out, xp):
+    """Resample a pupil-plane map `a` (whose side spans the telescope diameter)
+    so that this diameter covers `n_pix_pup` pixels of a centred n_out x n_out grid.
+
+    Integer n_pix_pup: congrid to n_pix_pup pixels then pad, as before.
+    Non-integer n_pix_pup (the exact D * freq_range): linear resampling with the
+    exact scale, so that the diameter is not rounded to an integer number of
+    pixels (rounding changes D by up to one pixel, hence the PSF peak by ~2/n_pix_pup).
+    """
+    n_pix_pup = float(n_pix_pup)
+    if n_pix_pup.is_integer():
+        return _pad_or_crop_centered(congrid(a, [int(n_pix_pup), int(n_pix_pup)]), n_out, xp=xp)
+    if xp == cp and gpuEnabled:
+        from cupyx.scipy.ndimage import affine_transform
+    else:
+        from scipy.ndimage import affine_transform
+    a = xp.asarray(a)
+    if a.dtype.kind not in 'fc':
+        a = a.astype(defaultArrayDtype)
+    scale = a.shape[0] / n_pix_pup                  # input pixels per output pixel
+    offset = (a.shape[0] - 1) / 2 - (n_out // 2) * scale
+    return affine_transform(a, matrix=xp.asarray([scale, scale], dtype=float),
+                            offset=[offset, offset], output_shape=(n_out, n_out),
+                            order=1, mode='constant', cval=0.0)
 
 
 def _resample_full_flux(sampling, zoom_factor, n_out, xp, transform):
@@ -668,8 +708,8 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
     full_flux=True returns pixel-integrated fractions of complete propagation
     power. Interpolation is normalized on complete output support before
     cropping; changing nPixPsf at fixed pixel scale cannot change overlapping
-    pixels. A crop can contain less than unit power. The default False retains
-    the existing amplitude and resampling behavior.
+    pixels. A crop can contain less than unit power. Ordinary output
+    uses centred point sampling for exact per-wavelength decimation.
 
     Two calling conventions are supported, auto-detected from inputPSDs:
 
@@ -815,7 +855,7 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
             wvl, wvl_psds, wvl_freq_range, wvl_dk = loop_item
             N = wvl_psds[0].shape[0]
             grid_diameter = N / float(wvl_freq_range)
-            wvl_nPixPup = int(nPixPup_seq[wvl_idx])
+            wvl_nPixPup = float(nPixPup_seq[wvl_idx])
         else:
             wvl, ovrsmp = loop_item
             wvl_psds = inputPSDs
@@ -864,8 +904,7 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
         # 3. PREPARE OPTICAL ELEMENTS AT NATIVE RESOLUTION
         maskField = Field(wvl, n_internal, grid_diameter)
         if not isinstance(mask, list):
-            maskField.sampling = congrid(mask, [wvl_nPixPup, wvl_nPixPup])
-            maskField.sampling = _pad_or_crop_centered(maskField.sampling, n_internal, xp=maskField.xp)
+            maskField.sampling = pupilOnGrid(mask, wvl_nPixPup, n_internal, maskField.xp)
 
         if xp is None:
             xp = maskField.xp
@@ -881,9 +920,8 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
             maskOtf = Field(wvl, n_internal, grid_diameter)
             coeff = defaultArrayBackend.asarray(2 * np.pi * 1e-9 / wvl, dtype=defaultArrayDtype)
             opd_map_backend = defaultArrayBackend.asarray(opdMap, dtype=defaultArrayDtype)
-            phaseStat = coeff * opd_map_backend
-            phaseStat = congrid(phaseStat, [wvl_nPixPup, wvl_nPixPup])
-            phaseStat = _pad_or_crop_centered(phaseStat, n_internal, xp)
+            input_phase = coeff * opd_map_backend
+            phaseStat = pupilOnGrid(input_phase, wvl_nPixPup, n_internal, xp)
             if mask is None or not isinstance(mask, list):
                 maskOtf.sampling = maskField.sampling * xp.exp(i_complex * phaseStat)
                 maskOtf.pupilToOtf()
@@ -898,8 +936,7 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
         for i, computedPSD in enumerate(wvl_psds):
 
             if isinstance(mask, list):
-                maskField.sampling = congrid(mask[i], [wvl_nPixPup, wvl_nPixPup])
-                maskField.sampling = _pad_or_crop_centered(maskField.sampling, n_internal, xp)
+                maskField.sampling = pupilOnGrid(mask[i], wvl_nPixPup, n_internal, xp)
                 if opdMap is not None:
                     maskOtf.sampling = maskField.sampling * xp.exp(i_complex * phaseStat)
                     maskOtf.pupilToOtf()
@@ -927,8 +964,11 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                 if coherent_pupil is None or isinstance(mask, list):
                     coherent_pupil = np.asarray(hostData(maskField.sampling), dtype=np.complex128)
                     if opdMap is not None:
-                        fit_phase = hostData(congrid(xp.asarray(opdMap) * (2 * np.pi * 1e-9 / wvl),
-                                                     tilt_projector.fit_shape))
+                        if tilt_projector.fractional_pupil:
+                            fit_phase = hostData(input_phase)
+                        else:
+                            fit_phase = hostData(congrid(xp.asarray(opdMap) * (2 * np.pi * 1e-9 / wvl),
+                                                         tilt_projector.fit_shape))
                         native_phase = tilt_projector.remove_static_tilt(hostData(phaseStat), fit_phase)
                         coherent_pupil = coherent_pupil * np.exp(1j * native_phase)
                 phase_spectrum = np.fft.ifftshift(hostData(psd.sampling)) * (psd.kk * psd.width) ** 2 / 4
@@ -947,10 +987,11 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                 psfLE.sampling /= native_flux
 
             if per_wavelength_psd:
-                # 5. EXACT INTEGER DECIMATION (flux-conserving, no interpolation)
+                # 5. EXACT INTEGER DECIMATION
                 if psfLE.N != int(nPixPsf):
                     native_flux = float(psfLE.sampling.sum()) if debug_trace else None
-                    resampled = _exact_block_decimate(psfLE.sampling, nPixPsf, xp)
+                    resampled = _exact_block_decimate(psfLE.sampling, nPixPsf, xp,
+                                                      integrate_pixels=full_flux)
                     if debug_trace:
                         print(f"  [PSD {i}] Native Flux : {native_flux:.6e}")
                         print(f"  [PSD {i}] Output Flux : {float(resampled.sum()):.6e}")

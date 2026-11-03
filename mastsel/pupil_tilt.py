@@ -226,28 +226,35 @@ class _PupilTiltProjector:
     ``fit_pupil`` is the real, nonnegative pupil amplitude before native optical
     resampling. Its intensity supplies fit weights (uniform on a binary pupil).
     ``pupil_pixels`` is the native resampled full-telescope pupil width, even
-    when the optical aperture is an NGS subaperture. Coordinates follow the
-    existing MASTSEL congrid convention. The static phase and the Gaussian
-    residual are projected by the same two-mode operator.
+    when the optical aperture is an NGS subaperture. Integer widths use
+    the congrid convention. Fractional widths centre the original pupil
+    samples on the native grid, as in pupilOnGrid. The same two-mode operator
+    projects static phase and the Gaussian residual.
     """
 
     def __init__(self, fit_pupil, n, pupil_pixels):
         self.fit = pupilTiltFit(fit_pupil)
-        if n < 2 or n % 2 or pupil_pixels <= 0:
+        if n < 2 or n % 2 or not np.isfinite(pupil_pixels) or pupil_pixels <= 0:
             raise ValueError('pupil_fit requires a positive even native optical grid')
         self.n = int(n)
-        self.pupil_pixels = int(pupil_pixels)
+        self.fractional_pupil = not float(pupil_pixels).is_integer()
+        self.pupil_pixels = float(pupil_pixels) if self.fractional_pupil else int(pupil_pixels)
         # One compact support cache per projector; amplitudes and phase stay live.
         self._overlap_positions = None
         self._overlap_geometry = None
         self.fit_shape = self.fit.shape[1:]
         fine = self.fit_shape[0]
-        positions = self.n / 2 - self.pupil_pixels / 2 + np.arange(fine) * self.pupil_pixels / fine
+        if self.fractional_pupil:
+            positions = self.n // 2 + (np.arange(fine) - (fine - 1) / 2) * self.pupil_pixels / fine
+            ramp_offset = 0.0
+        else:
+            positions = self.n / 2 - self.pupil_pixels / 2 + np.arange(fine) * self.pupil_pixels / fine
+            ramp_offset = 1 / fine
         transform = np.exp(2j * np.pi * np.fft.fftfreq(self.n)[:, None] * positions[None, :])
         self.kernels = np.asarray([transform @ fit @ transform.T / self.n ** 2 for fit in self.fit])
         yy, xx = np.mgrid[:self.n, :self.n]
-        self.ramps = np.stack((2 * (xx - self.n / 2) / self.pupil_pixels + 1 / fine,
-                               2 * (yy - self.n / 2) / self.pupil_pixels + 1 / fine))
+        self.ramps = np.stack((2 * (xx - self.n / 2) / self.pupil_pixels + ramp_offset,
+                               2 * (yy - self.n / 2) / self.pupil_pixels + ramp_offset))
 
     def _coherence(self, covariance, cross, tilt_covariance, ys, xs, amplitudes):
         """Reuse bounded overlap runs only for the native Numba kernel.
@@ -278,10 +285,19 @@ class _PupilTiltProjector:
     def remove_static_tilt(self, native_phase, fit_phase):
         """Subtract the original-pupil static fit on the native optical grid.
 
-        Both inputs are radians, on the native grid and fit pupil respectively.
-        This matches fitting the total residual after a static OPD is added.
-        The supplied maps are read only.
+        Both inputs are radians. The second map is on the fit pupil for
+        integer widths. For fractional widths it may instead be supplied on
+        its original pupil grid, spanning the same physical diameter.
         """
+        if self.fractional_pupil and np.shape(fit_phase) != self.fit_shape:
+            from scipy.interpolate import RegularGridInterpolator
+            # Sample at the centres of the fit pupil's pixels in the same
+            # pupil coordinates as the fractional optical resampling.
+            source = tuple((np.arange(size) + 0.5) / size for size in fit_phase.shape)
+            y, x = np.ogrid[:self.fit_shape[0], :self.fit_shape[1]]
+            coordinates = ((y + 0.5) / self.fit_shape[0], (x + 0.5) / self.fit_shape[1])
+            fit_phase = RegularGridInterpolator(source, fit_phase, bounds_error=False,
+                                                fill_value=None)(coordinates)
         if np.shape(native_phase) != (self.n, self.n) or np.shape(fit_phase) != self.fit_shape:
             raise ValueError('Static phase must match the native and fit-pupil grids')
         coefficients = np.einsum('iyx,yx->i', self.fit, fit_phase)
