@@ -73,9 +73,45 @@ def _cached_subs(expr, subs_dict):
     return _subs_cached_impl(expr, items)
 
 
+_PY_TO_NP = {int: np.int64, float: np.float64, complex: np.complex128}
+
+
+class _FusedOrPlain:
+    """A lambdified elementwise expression as one fused cupy kernel.
+
+    The sympy-generated code of the loop transfer functions launches a kernel per
+    operation (~2 ms per call on a 14 x 625 grid, 0.1 ms fused). The first call
+    checks the fused kernel against the plain function, and keeps the plain one if
+    cupy cannot fuse the expression or the results differ: inside cp.fuse a ufunc
+    of a Python scalar alone (e.g. tan(0.3), from a sympy constant) is computed in
+    float16.
+    """
+
+    def __init__(self, f):
+        self.plain = f
+        self.fused = cp.fuse(kernel_name='mastsel_lo_tf')(f)
+        self.use_fused = None  # unknown until the first call
+
+    def __call__(self, *args):
+        # numpy scalars, not Python ones, so that an op on a scalar argument alone
+        # (e.g. -x) is not computed in float16 inside the fused kernel
+        args = tuple(_PY_TO_NP[type(a)](a) if type(a) in _PY_TO_NP else a for a in args)
+        if self.use_fused is None:
+            ref = self.plain(*args)
+            try:
+                self.use_fused = bool(cp.allclose(self.fused(*args), ref, rtol=1e-9, atol=0))
+            except Exception:
+                self.use_fused = False
+            return ref
+        return self.fused(*args) if self.use_fused else self.plain(*args)
+
+
 @functools.lru_cache(maxsize=64)
 def _lambdify_cached(expr, names, use_gpulib):
-    return lambdifyByName(expr, list(names), gpulib if use_gpulib else cpulib)
+    f = lambdifyByName(expr, list(names), gpulib if use_gpulib else cpulib)
+    if use_gpulib and gpuEnabled:
+        return _FusedOrPlain(f)
+    return f
 
 
 @functools.lru_cache(maxsize=None)
@@ -163,28 +199,42 @@ def maxStableGain(delay):
         maxG = 0.1
     return maxG
 
+def _package_dir(name):
+    """Directory of an installed package, found without importing it.
+
+    importlib.util.find_spec locates a top-level package without executing its
+    __init__: `import tiptop` here would import TIPTOP, hence P3 and astropy,
+    at every `import mastsel`.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.find_spec(name)
+    if spec is None or spec.origin is None:
+        return None
+    return Path(spec.origin).resolve().parent
+
+
 def detect_tiptop_path():
-    """Locate TIPTOP configuration data without importing the engine."""
-    from importlib.util import find_spec
+    """Auto-detect the TIPTOP project root path."""
     from pathlib import Path
 
     try:
-        spec = find_spec('tiptop')
+        package_dir = _package_dir('tiptop')
+        if package_dir is None:
+            raise ImportError('tiptop not found')
+        return str(package_dir.parent)
     except (ImportError, ValueError):
-        spec = None
-    if spec is not None and spec.origin is not None:
-        return str(Path(spec.origin).resolve().parent.parent)
+        import inspect as inspect_module
 
-    import inspect
-
-    try:
-        for frame_info in inspect.stack(context=0):
-            path = Path(frame_info.filename).resolve()
-            for parent in (path, *path.parents):
-                if parent.name == 'tiptop':
-                    return str(parent.parent)
-    except (AttributeError, OSError, RuntimeError):
-        pass
+        try:
+            for frame_info in inspect_module.stack(context=0):
+                p = Path(frame_info.filename).resolve()
+                for parent in (p, *p.parents):
+                    if parent.name == 'tiptop':
+                        return str(parent.parent)
+        except (AttributeError, OSError, RuntimeError):
+            pass
     return None
 
 
@@ -193,11 +243,9 @@ def detect_p3_path():
     from pathlib import Path
 
     try:
-        import p3
-
-        project_root = Path(p3.__file__).resolve().parent
-        return str(project_root)
-    except (ImportError, AttributeError, OSError):
+        package_dir = _package_dir('p3')
+        return None if package_dir is None else str(package_dir)
+    except (ImportError, ValueError, OSError):
         return None
 
 PATH_TIPTOP = detect_tiptop_path()
