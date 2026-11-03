@@ -491,7 +491,76 @@ def pixelOtf(n, pixel_ratio, xp=defaultArrayBackend):
     return s[:, None] * s[None, :]
 
 
-def longExposurePsf(mask, psd, otf_tel=None, otf_pixel=None):
+def _perfect_coronagraph_otf(pupil, g, otf_tel, xp):
+    """
+    OTF of the long-exposure image behind a perfect coronagraph.
+
+    The coronagraph removes, frame by frame, the projection a P of the field
+    E = P exp(i phi) on the pupil mode: a = sum(Q exp(i phi)) / S, Q = P^2,
+    S = sum(Q). The long-exposure image of E - a P is
+
+        <|FT(E - a P)|^2> = <|FT E|^2> - 2 Re[<a* FT E> conj(FT P)] + <|a|^2> |FT P|^2
+
+    and each term depends only on g(x - y) = <exp(i (phi(x) - phi(y)))>, which
+    for a Gaussian, stationary phase is exp(-D_phi / 2) (the turbulence OTF):
+
+        <a* E(x)>  = P(x) (Q conv g)(x) / S
+        <|a|^2>    = sum((Q corr Q) g) / S^2 = SR, the long-exposure Strehl ratio
+
+    so that, in the OTF (autocorrelation) domain,
+
+        OTF_c = A_P g - (X(rho) + X(-rho)) / S + SR A_P,
+        A_P = P corr P (telescope OTF),  X = [P (Q conv g)] corr P.
+
+    Exact under those two assumptions; g = 1 gives OTF_c = 0, and the image sums
+    to (1 - SR) times the PSF. Simpler recipes, PSF - SR PSF_DL or
+    PSF - exp(-sigma^2) PSF_DL, replace <a* FT E> by SR FT P (or |<a>|^2 FT P),
+    i.e. they assume that the field correlated with a is diffraction limited;
+    that fails within 1-2 lambda/D (see longExposurePsf).
+
+    pupil, g and otf_tel are centred n x n arrays on the same grid; the result
+    has the normalization of otf_tel.
+    """
+    # float64 throughout: the image is a near cancellation of the three terms
+    P = xp.fft.ifftshift(xp.asarray(pupil, dtype=xp.float64))   # origin at index 0
+    Q = P * P
+    g0 = xp.fft.ifftshift(xp.asarray(g, dtype=xp.float64))
+    fP = xp.fft.fft2(P)
+    A_P = xp.real(xp.fft.ifft2(fP * xp.conj(fP)))
+    Qg = xp.real(xp.fft.ifft2(xp.fft.fft2(Q) * xp.fft.fft2(g0)))   # (Q conv g)(x)
+    X = xp.real(xp.fft.ifft2(xp.fft.fft2(P * Qg) * xp.conj(fP)))
+    X_minus = xp.roll(xp.flip(X, (0, 1)), 1, axis=(0, 1))           # X(-rho)
+    S = float(Q.sum())
+    sr = float((Q * Qg).sum()) / S**2      # = sum((Q corr Q) g) / S^2, g even
+    otf_c = A_P * g0 - (X + X_minus) / S + sr * A_P
+    c = otf_tel.shape[0] // 2
+    scale = complex(otf_tel[c, c]) / float(A_P[0, 0])
+    return (xp.fft.fftshift(otf_c) * scale).astype(otf_tel.dtype)
+
+
+def longExposurePsf(mask, psd, otf_tel=None, otf_pixel=None, perfect_coronagraph=False):
+    """
+    Long-exposure PSF of a residual phase with power spectral density psd:
+    PSF = FT[OTF_tel exp(B_phi - sigma^2)], with B_phi the phase covariance
+    (inverse FFT of the PSD) and sigma^2 = B_phi(0).
+
+    With perfect_coronagraph=True: image behind a perfect coronagraph (Cavarroc
+    et al. 2006), which removes, frame by frame, the projection a P of the field
+    E = P exp(i phi) on the pupil mode, a = sum(P E) / sum(P^2). Its long-exposure
+    average depends only on the second-order moments of the field, so it is exact
+    for a Gaussian, stationary phase (see _perfect_coronagraph_otf); its sum is
+    the scattered fraction 1 - SR.
+    The simpler recipes PSF - exp(-sigma^2) PSF_DL (removal of the coherent part
+    of the long-exposure field) and PSF - SR PSF_DL assume that the field
+    correlated with a is diffraction limited; the first also misses
+    <|a|^2> - |<a>|^2, the frame-to-frame fluctuation of the coherent energy
+    (tip-tilt jitter). Against a frame-by-frame coronagraph on SPECULA ERIS
+    residual fields (validation/perfect_coronagraph, SR 0.77-0.97) they are off
+    by 26-30 % at 0.5-1 lambda/D and by factors 0.01-1.3 within 0.5 lambda/D;
+    this formula is within 7 % beyond 0.5 lambda/D and +17..+41 % within it
+    (non-Gaussian residual, a hypothesis). Beyond 2 lambda/D all agree within
+    6 %, and far from the axis they reduce to the PSD (Fusco et al. 2006).
+    """
     xp = mask.xp
     if defaultArrayDtype == defaultArrayBackend.float32:
         dtype = xp.float32
@@ -562,7 +631,10 @@ def longExposurePsf(mask, psd, otf_tel=None, otf_pixel=None):
         B_phi = congrid(B_phi, [target_n, target_n])
 
     # step 4 : combine telescope and turbulence otfs
-    otf_system = B_phi * otf_tel
+    if perfect_coronagraph:
+        otf_system = _perfect_coronagraph_otf(mask.sampling, B_phi, otf_tel, xp)
+    else:
+        otf_system = B_phi * otf_tel
     if otf_pixel is not None:
         # detector pixel integration: PSF * box  <->  OTF . sinc
         otf_system *= otf_pixel
@@ -653,7 +725,7 @@ def _expand_odd_psd_to_even_with_zero_nyquist(psd, xp=defaultArrayBackend):
     return out
 
 
-def _exact_block_decimate(sampling, nPixPsf, xp, *, integrate_pixels=False):
+def _exact_block_decimate(sampling, nPixPsf, xp, *, integrate_pixels=False, ref=None):
     """Decimate by an exact integer factor while preserving total power.
 
     Ordinary output takes centred point samples and rescales their sum.
@@ -675,7 +747,10 @@ def _exact_block_decimate(sampling, nPixPsf, xp, *, integrate_pixels=False):
         return sampling.reshape(n_out, k, n_out, k).sum(axis=(1, 3))
     idx = n_in // 2 + k * xp.arange(-(n_out // 2), n_out - n_out // 2)
     out = sampling[idx][:, idx]
-    return out * (sampling.sum() / out.sum())
+    # ref (default: the image itself) sets the flux factor: with the PSF as ref a
+    # coronagraphic image keeps the image / PSF ratio (contrast)
+    ref = sampling if ref is None else ref
+    return out * (ref.sum() / ref[idx][:, idx].sum())
 
 
 def pupilOnGrid(a, n_pix_pup, n_out, xp):
@@ -732,7 +807,7 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                    opdMap=None, padPSD=False, skip_reshape=False,
                    internal_grid_mode='even_legacy', debug_trace=False,
                    full_flux=False, tip_tilt_removal='none', tilt_fit_pupil=None,
-                   pixelResponse=False):
+                   pixelResponse=False, perfectCoronagraph=False):
     """
     Transforms a set of PSDs into PSFs.
 
@@ -792,7 +867,16 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
     for a non-integer native/output ratio, with or without pixelResponse).
     With full_flux=True, explicit pixel response replaces the per-wavelength
     block sum. The default False keeps the existing sampling convention.
+
+    perfectCoronagraph=True models a perfect coronagraph for stationary phase.
+    Static aberrations, pupil-fit tilt removal and full-flux output are outside
+    this mode's supported scope.
     """
+    if perfectCoronagraph:
+        if opdMap is not None:
+            raise ValueError("perfectCoronagraph is not supported with opdMap (static aberrations).")
+        if tip_tilt_removal != 'none' or full_flux:
+            raise ValueError("perfectCoronagraph requires stationary optics and full_flux=False.")
     if tip_tilt_removal not in ('none', 'pupil_fit'):
         raise ValueError("tip_tilt_removal must be 'none' or 'pupil_fit'")
     if tip_tilt_removal == 'pupil_fit' and internal_grid_mode != 'even_legacy':
@@ -1014,6 +1098,7 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
             psd.sampling = psd_sampling
 
             # Execute Fourier propagation at Native Scale
+            psf_ref = None
             if tip_tilt_removal == 'pupil_fit':
                 from .pupil_tilt import _PupilTiltProjector
                 fit_mask = tilt_fit_pupil if tilt_fit_pupil is not None else (
@@ -1046,12 +1131,19 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                     raise ValueError('Full-flux propagation requires positive finite native power.')
                 psfLE.sampling /= native_flux
 
+            if perfectCoronagraph:
+                # the PSF sets the flux factor of the resampling below, so that the
+                # coronagraphic image / PSF ratio (contrast) is that of the native grid
+                psf_ref = psfLE.sampling
+                psfLE = longExposurePsf(maskField, psd, otf_tel=otf_tel, otf_pixel=otf_pixel,
+                                        perfect_coronagraph=True)
+
             if per_wavelength_psd:
                 # 5. EXACT INTEGER DECIMATION
                 if psfLE.N != int(nPixPsf):
                     native_flux = float(psfLE.sampling.sum()) if debug_trace else None
                     resampled = _exact_block_decimate(psfLE.sampling, nPixPsf, xp,
-                                                      integrate_pixels=full_flux and not pixelResponse)
+                                                      integrate_pixels=full_flux and not pixelResponse, ref=psf_ref)
                     if debug_trace:
                         print(f"  [PSD {i}] Native Flux : {native_flux:.6e}")
                         print(f"  [PSD {i}] Output Flux : {float(resampled.sum()):.6e}")
@@ -1070,8 +1162,8 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                     psfLE.width = int(nPixPsf) * target_ps_rad
                 elif abs(zoom_factor - 1.0) > 1e-6 or psfLE.N != int(nPixPsf):
 
-                    # Measure total flux before interpolation
-                    native_flux = float(psfLE.sampling.sum())
+                    # Measure total flux before interpolation (of the PSF behind a coronagraph)
+                    native_flux = float((psfLE.sampling if psf_ref is None else psf_ref).sum())
 
                     N_out = int(nPixPsf)
                     cy_out, cx_out = N_out // 2, N_out // 2
@@ -1087,8 +1179,8 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                     transform_matrix = xp.asarray([scale, scale], dtype=defaultArrayDtype)
 
                     # affine_transform avoids creating coordinate grids in memory.
-                    resampled = a_affine_transform(
-                        psfLE.sampling,
+                    resample = lambda img: a_affine_transform(
+                        img,
                         matrix=transform_matrix,
                         offset=[offset_y, offset_x],
                         output_shape=(N_out, N_out),
@@ -1096,9 +1188,10 @@ def psdSetToPsfSet(inputPSDs, mask, wavelength,
                         mode='constant',
                         cval=0.0
                     )
+                    resampled = resample(psfLE.sampling)
 
                     # 6. RIGOROUS FLUX NORMALIZATION (In-place operation)
-                    resampled_flux = float(resampled.sum())
+                    resampled_flux = float((resampled if psf_ref is None else resample(psf_ref)).sum())
                     if resampled_flux > 0:
                         resampled *= (native_flux / resampled_flux)
 
